@@ -20,8 +20,8 @@ include_guard()
 include(cmake/utils.cmake)
 
 FetchContent_DeclareGitHubWithMirror(zstd
-  facebook/zstd v1.5.7
-  MD5=2a98f5f27ec041e8b442382103229f44
+  facebook/zstd v1.5.5
+  MD5=f336cde1961ee7e5d3a7f8c0c0f96987
 )
 
 FetchContent_GetProperties(zstd)
@@ -32,7 +32,7 @@ if(NOT zstd_POPULATED)
     set(APPLE_FLAG "CFLAGS=-isysroot ${CMAKE_OSX_SYSROOT}")
   endif()
 
-  add_custom_target(make_zstd COMMAND ${MAKE_COMMAND} ${NINJA_MAKE_JOBS_FLAG} CC=${CMAKE_C_COMPILER} ${APPLE_FLAG} libzstd.a
+  add_custom_target(make_zstd COMMAND ${MAKE_COMMAND} CC=${CMAKE_C_COMPILER} ${APPLE_FLAG} libzstd.a
     WORKING_DIRECTORY ${zstd_SOURCE_DIR}/lib
     BYPRODUCTS ${zstd_SOURCE_DIR}/lib/libzstd.a
   )

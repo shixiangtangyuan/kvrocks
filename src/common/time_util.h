@@ -24,12 +24,16 @@
 
 namespace util {
 
-/// Get the system timestamp in seconds, milliseconds or microseconds.
 template <typename Duration = std::chrono::seconds>
 auto GetTimeStamp() {
   return std::chrono::duration_cast<Duration>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 inline uint64_t GetTimeStampMS() { return GetTimeStamp<std::chrono::milliseconds>(); }
 inline uint64_t GetTimeStampUS() { return GetTimeStamp<std::chrono::microseconds>(); }
+
+inline int64_t GetDurationMSSince(std::chrono::steady_clock::time_point& start) {
+  auto end = std::chrono::steady_clock::now();
+  return std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+}
 
 }  // namespace util

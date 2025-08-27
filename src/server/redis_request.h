@@ -32,9 +32,6 @@ class Server;
 
 namespace redis {
 
-constexpr size_t PROTO_INLINE_MAX_SIZE = 16 * 1024L;
-constexpr size_t PROTO_MULTI_MAX_SIZE = 1024 * 1024L;
-
 using CommandTokens = std::vector<std::string>;
 
 class Connection;
@@ -49,9 +46,7 @@ class Request {
   Request &operator=(const Request &) = delete;
 
   // Parse the redis requests (bulk string array format)
-  Status Tokenize(evbuffer *input);
-
-  std::deque<CommandTokens> *GetCommands() { return &commands_; }
+  Status Tokenize(evbuffer *input, std::deque<CommandTokens> *commands);
 
  private:
   // internal states related to parsing
@@ -61,7 +56,6 @@ class Request {
   int64_t multi_bulk_len_ = 0;
   size_t bulk_len_ = 0;
   CommandTokens tokens_;
-  std::deque<CommandTokens> commands_;
 
   Server *srv_;
 };

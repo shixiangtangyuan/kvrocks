@@ -34,7 +34,7 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
-	"github.com/shirou/gopsutil/v4/process"
+	"github.com/shirou/gopsutil/v3/process"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/exp/slices"
 )
@@ -73,9 +73,7 @@ func (s *KvrocksServer) TLSAddr() string {
 
 func (s *KvrocksServer) LogFileMatches(t testing.TB, pattern string) bool {
 	dir := s.configs["dir"]
-	now := time.Now()
-	filename := dir + fmt.Sprintf("/kvrocks_%d-%02d-%02d.log", now.Year(), now.Month(), now.Day())
-	content, err := os.ReadFile(filename)
+	content, err := os.ReadFile(dir + "/kvrocks.INFO")
 	require.NoError(t, err)
 	p := regexp.MustCompile(pattern)
 	return p.Match(content)
@@ -85,19 +83,11 @@ func (s *KvrocksServer) NewClient() *redis.Client {
 	return s.NewClientWithOption(&redis.Options{})
 }
 
-func optionsWithTimeouts(options *redis.Options) *redis.Options {
-	options.DialTimeout = 30 * time.Second
-	options.ReadTimeout = 30 * time.Second
-	options.WriteTimeout = 30 * time.Second
-	return options
-}
-
 func (s *KvrocksServer) NewClientWithOption(options *redis.Options) *redis.Client {
 	if options.Addr == "" {
 		options.Addr = s.addr.String()
 	}
-
-	return redis.NewClient(optionsWithTimeouts(options))
+	return redis.NewClient(options)
 }
 
 func (s *KvrocksServer) NewTCPClient() *TCPClient {
@@ -114,10 +104,6 @@ func (s *KvrocksServer) NewTCPTLSClient(conf *tls.Config) *TCPClient {
 
 func (s *KvrocksServer) Close() {
 	s.close(false)
-}
-
-func (s *KvrocksServer) CloseWithoutCleanup() {
-	s.close(true)
 }
 
 func (s *KvrocksServer) close(keepDir bool) {
@@ -150,10 +136,7 @@ func (s *KvrocksServer) close(keepDir bool) {
 
 func (s *KvrocksServer) Restart() {
 	s.close(true)
-	s.Start()
-}
 
-func (s *KvrocksServer) Start() {
 	b := *binPath
 	require.NotEmpty(s.t, b, "please set the binary path by `-binPath`")
 	cmd := exec.Command(b)
@@ -238,13 +221,20 @@ func StartServerWithCLIOptions(
 	require.NoError(t, err)
 	configs["dir"] = dir
 
+	dbDir := dir + "/volumes/dbid"
+	err = os.MkdirAll(dbDir, os.ModePerm)
+	if err != nil {
+		fmt.Println("Failed to create data directory to start server, dir: ", err)
+	}
+	configs["datadir-list"] = dbDir
+
 	if withConfigFile {
 		f, err := os.Create(filepath.Join(dir, "kvrocks.conf"))
 		require.NoError(t, err)
 		defer func() { require.NoError(t, f.Close()) }()
 
 		for k := range configs {
-			_, err := fmt.Fprintf(f, "%s %s\n", k, configs[k])
+			_, err := f.WriteString(fmt.Sprintf("%s %s\n", k, configs[k]))
 			require.NoError(t, err)
 		}
 		cmd.Args = append(cmd.Args, "-c", f.Name())

@@ -22,7 +22,6 @@
 
 #include <gtest/gtest.h>
 
-#include <initializer_list>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -78,174 +77,11 @@ TEST(StringUtil, TokenizeRedisProtocol) {
   ASSERT_EQ(expected, array);
 }
 
-TEST(StringUtil, StartsEndsWith) {
-  ASSERT_TRUE(util::StartsWith("has_prefix_is_true", "has_prefix"));
-  ASSERT_FALSE(util::StartsWith("has_prefix_is_false", "_has_prefix"));
-  ASSERT_TRUE(util::StartsWith("has_prefix", "has_prefix"));
-  ASSERT_FALSE(util::StartsWith("has", "has_prefix"));
-  ASSERT_TRUE(util::EndsWith("has_suffix_is_true", "_is_true"));
-  ASSERT_FALSE(util::EndsWith("has_suffix_is_false", "has_suffix"));
-  ASSERT_TRUE(util::EndsWith("has_suffix", "has_suffix"));
-  ASSERT_FALSE(util::EndsWith("has", "has_suffix"));
-  ASSERT_TRUE(util::StartsWithICase("has_prefix_is_true", "has_PREfix"));
-  ASSERT_FALSE(util::StartsWithICase("has_prefix_is_false", "_has_prefix"));
-  ASSERT_TRUE(util::EndsWithICase("has_suffix_IS_true", "_is_true"));
-  ASSERT_FALSE(util::EndsWithICase("has_suffix_is_false", "has_suffix"));
-}
-
-TEST(StringUtil, ValidateGlob) {
-  const auto expect_ok = [](std::string_view glob) {
-    const auto result = util::ValidateGlob(glob);
-    EXPECT_TRUE(result.IsOK()) << glob << ": " << result.Msg();
-  };
-
-  const auto expect_error = [](std::string_view glob, std::string_view expected_error) {
-    const auto result = util::ValidateGlob(glob);
-    EXPECT_FALSE(result.IsOK());
-    EXPECT_EQ(result.Msg(), expected_error) << glob;
-  };
-
-  expect_ok("a");
-  expect_ok("\\*");
-  expect_ok("\\?");
-  expect_ok("\\[");
-  expect_ok("\\]");
-  expect_ok("a*");
-  expect_ok("a?");
-  expect_ok("[ab]");
-  expect_ok("[^ab]");
-  expect_ok("[a-c]");
-  // Surprisingly valid: this accepts the characters {a, b, c, e, f, g, -}
-  expect_ok("[a-c-e-g]");
-  expect_ok("[^a-c]");
-  expect_ok("[-]");
-  expect_ok("[\\]]");
-  expect_ok("[\\\\]");
-  expect_ok("[\\?]");
-  expect_ok("[\\*]");
-  expect_ok("[\\[]");
-
-  expect_error("[", "Unterminated [ group");
-  expect_error("]", "Unmatched unescaped ]");
-  expect_error("[a", "Unterminated [ group");
-  expect_error("\\", "Trailing unescaped backslash");
-
-  // Weird case: we open a character class, with the range 'a' to ']', but then never close it
-  expect_error("[a-]", "Unterminated [ group");
-  expect_ok("[a-]]");
-}
-
-TEST(StringUtil, StringMatch) {
-  /* Some basic tests */
-  EXPECT_TRUE(util::StringMatch("a", "a"));
-  EXPECT_FALSE(util::StringMatch("a", "b"));
-  EXPECT_FALSE(util::StringMatch("a", "aa"));
-  EXPECT_FALSE(util::StringMatch("a", ""));
-  EXPECT_TRUE(util::StringMatch("", ""));
-  EXPECT_FALSE(util::StringMatch("", "a"));
-  EXPECT_TRUE(util::StringMatch("*", ""));
-  EXPECT_TRUE(util::StringMatch("*", "a"));
-
-  /* Simple character class tests */
-  EXPECT_TRUE(util::StringMatch("[a]", "a"));
-  EXPECT_FALSE(util::StringMatch("[a]", "b"));
-  EXPECT_FALSE(util::StringMatch("[^a]", "a"));
-  EXPECT_TRUE(util::StringMatch("[^a]", "b"));
-  EXPECT_TRUE(util::StringMatch("[ab]", "a"));
-  EXPECT_TRUE(util::StringMatch("[ab]", "b"));
-  EXPECT_FALSE(util::StringMatch("[ab]", "c"));
-  EXPECT_TRUE(util::StringMatch("[^ab]", "c"));
-  EXPECT_TRUE(util::StringMatch("[a-c]", "b"));
-  EXPECT_FALSE(util::StringMatch("[a-c]", "d"));
-
-  /* Corner cases in character class parsing */
-  EXPECT_TRUE(util::StringMatch("[a-c-e-g]", "-"));
-  EXPECT_FALSE(util::StringMatch("[a-c-e-g]", "d"));
-  EXPECT_TRUE(util::StringMatch("[a-c-e-g]", "f"));
-
-  /* Escaping */
-  EXPECT_TRUE(util::StringMatch("\\?", "?"));
-  EXPECT_FALSE(util::StringMatch("\\?", "a"));
-  EXPECT_TRUE(util::StringMatch("\\*", "*"));
-  EXPECT_FALSE(util::StringMatch("\\*", "a"));
-  EXPECT_TRUE(util::StringMatch("\\[", "["));
-  EXPECT_TRUE(util::StringMatch("\\]", "]"));
-  EXPECT_TRUE(util::StringMatch("\\\\", "\\"));
-  EXPECT_TRUE(util::StringMatch("[\\.]", "."));
-  EXPECT_TRUE(util::StringMatch("[\\-]", "-"));
-  EXPECT_TRUE(util::StringMatch("[\\[]", "["));
-  EXPECT_TRUE(util::StringMatch("[\\]]", "]"));
-  EXPECT_TRUE(util::StringMatch("[\\\\]", "\\"));
-  EXPECT_TRUE(util::StringMatch("[\\?]", "?"));
-  EXPECT_TRUE(util::StringMatch("[\\*]", "*"));
-
-  /* Simple wild cards */
-  EXPECT_TRUE(util::StringMatch("?", "a"));
-  EXPECT_FALSE(util::StringMatch("?", "aa"));
-  EXPECT_FALSE(util::StringMatch("??", "a"));
-  EXPECT_TRUE(util::StringMatch("?x?", "axb"));
-  EXPECT_FALSE(util::StringMatch("?x?", "abx"));
-  EXPECT_FALSE(util::StringMatch("?x?", "xab"));
-
-  /* Asterisk wild cards (backtracking) */
-  EXPECT_FALSE(util::StringMatch("*??", "a"));
-  EXPECT_TRUE(util::StringMatch("*??", "ab"));
-  EXPECT_TRUE(util::StringMatch("*??", "abc"));
-  EXPECT_TRUE(util::StringMatch("*??", "abcd"));
-  EXPECT_FALSE(util::StringMatch("??*", "a"));
-  EXPECT_TRUE(util::StringMatch("??*", "ab"));
-  EXPECT_TRUE(util::StringMatch("??*", "abc"));
-  EXPECT_TRUE(util::StringMatch("??*", "abcd"));
-  EXPECT_FALSE(util::StringMatch("?*?", "a"));
-  EXPECT_TRUE(util::StringMatch("?*?", "ab"));
-  EXPECT_TRUE(util::StringMatch("?*?", "abc"));
-  EXPECT_TRUE(util::StringMatch("?*?", "abcd"));
-  EXPECT_TRUE(util::StringMatch("*b", "b"));
-  EXPECT_TRUE(util::StringMatch("*b", "ab"));
-  EXPECT_FALSE(util::StringMatch("*b", "ba"));
-  EXPECT_TRUE(util::StringMatch("*b", "bb"));
-  EXPECT_TRUE(util::StringMatch("*b", "abb"));
-  EXPECT_TRUE(util::StringMatch("*b", "bab"));
-  EXPECT_TRUE(util::StringMatch("*bc", "abbc"));
-  EXPECT_TRUE(util::StringMatch("*bc", "bc"));
-  EXPECT_TRUE(util::StringMatch("*bc", "bbc"));
-  EXPECT_TRUE(util::StringMatch("*bc", "bcbc"));
-
-  /* Multiple asterisks (complex backtracking) */
-  EXPECT_TRUE(util::StringMatch("*ac*", "abacadaeafag"));
-  EXPECT_TRUE(util::StringMatch("*ac*ae*ag*", "abacadaeafag"));
-  EXPECT_TRUE(util::StringMatch("*a*b*[bc]*[ef]*g*", "abacadaeafag"));
-  EXPECT_FALSE(util::StringMatch("*a*b*[ef]*[cd]*g*", "abacadaeafag"));
-  EXPECT_TRUE(util::StringMatch("*abcd*", "abcabcabcabcdefg"));
-  EXPECT_TRUE(util::StringMatch("*ab*cd*", "abcabcabcabcdefg"));
-  EXPECT_TRUE(util::StringMatch("*abcd*abcdef*", "abcabcdabcdeabcdefg"));
-  EXPECT_FALSE(util::StringMatch("*abcd*", "abcabcabcabcefg"));
-  EXPECT_FALSE(util::StringMatch("*ab*cd*", "abcabcabcabcefg"));
-
-  /* Robustness to exponential blow-ups with lots of non-collapsible asterisks */
-  EXPECT_TRUE(
-      util::StringMatch("?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*a", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
-  EXPECT_FALSE(
-      util::StringMatch("?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*b", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
-}
-
-TEST(StringUtil, SplitGlob) {
-  using namespace std::string_literals;
-
-  // Basic functionality: no escaped characters
-  EXPECT_EQ(util::SplitGlob(""), std::make_pair(""s, ""s));
-  EXPECT_EQ(util::SplitGlob("string"), std::make_pair("string"s, ""s));
-  EXPECT_EQ(util::SplitGlob("string*"), std::make_pair("string"s, "*"s));
-  EXPECT_EQ(util::SplitGlob("*string"), std::make_pair(""s, "*string"s));
-  EXPECT_EQ(util::SplitGlob("str*ing"), std::make_pair("str"s, "*ing"s));
-  EXPECT_EQ(util::SplitGlob("string?"), std::make_pair("string"s, "?"s));
-  EXPECT_EQ(util::SplitGlob("?string"), std::make_pair(""s, "?string"s));
-  EXPECT_EQ(util::SplitGlob("ab[cd]ef"), std::make_pair("ab"s, "[cd]ef"s));
-
-  // Escaped characters; also tests that prefix is trimmed of backslashes
-  EXPECT_EQ(util::SplitGlob("str\\*ing*"), std::make_pair("str*ing"s, "*"s));
-  EXPECT_EQ(util::SplitGlob("str\\?ing?"), std::make_pair("str?ing"s, "?"s));
-  EXPECT_EQ(util::SplitGlob("str\\[ing[a]"), std::make_pair("str[ing"s, "[a]"s));
+TEST(StringUtil, HasPrefix) {
+  ASSERT_TRUE(util::HasPrefix("has_prefix_is_true", "has_prefix"));
+  ASSERT_FALSE(util::HasPrefix("has_prefix_is_false", "_has_prefix"));
+  ASSERT_TRUE(util::HasPrefix("has_prefix", "has_prefix"));
+  ASSERT_FALSE(util::HasPrefix("has", "has_prefix"));
 }
 
 TEST(StringUtil, EscapeString) {
@@ -264,75 +100,15 @@ TEST(StringUtil, EscapeString) {
 
 TEST(StringUtil, RegexMatchExtractSSTFile) {
   // Test for ExtractSSTFileNameFromError() in event_listener.cc
-  auto bg_error_str = {"Corruption: Corrupt or unsupported format_version: 1005 in /tmp/kvrocks/data/db/000038.sst",
+  auto bg_error_str = {"Corruption: Corrupt or unsupported format_version: 1005 in /tmp/datanode/data/db/000038.sst",
                        "Corruption: Bad table magic number: expected 9863518390377041911, found 9863518390377041912 in "
-                       "/tmp/kvrocks_db/data/db/000038.sst",
+                       "/tmp/datanode_db/data/db/000038.sst",
                        "Corruption: block checksum mismatch: stored = 3308200672, computed = 51173877, type = 4  in "
-                       "/tmp/kvrocks_db/data/db/000038.sst offset 0 size 15715"};
+                       "/tmp/datanode_db/data/db/000038.sst offset 0 size 15715"};
 
   for (const auto &str : bg_error_str) {
     auto match_results = util::RegexMatch(str, ".*(/\\w*\\.sst).*");
     ASSERT_TRUE(match_results.size() == 2);
     ASSERT_TRUE(match_results[1] == "/000038.sst");
-  }
-}
-
-TEST(StringUtil, SplitArguments) {
-  std::map<std::string, std::vector<std::string>> valid_cases = {
-      // With ' ' only
-      {"a b c", {"a", "b", "c"}},
-      // Other whitespace characters should work
-      {"a\tb\nc\fd", {"a", "b", "c", "d"}},
-
-      // With double quote escape characters
-      {R"(hello "a b" c)", {"hello", "a b", "c"}},
-      // With single quote escape characters
-      {R"('a b' c)", {"a b", "c"}},
-      // With both single and double quote escape characters
-      {R"(a 'b c' " d e ")", {"a", "b c", " d e "}},
-      // With both single and double quote escape characters
-      {R"(a " b c " 'd e')", {"a", " b c ", "d e"}},
-
-      // With the single quote escape characters
-      {R"('a\' b' c)", {"a' b", "c"}},
-      {R"('a\n\t\r\'b' c)", {R"(a\n\t\r'b)", "c"}},
-
-      // With the double quote escape characters
-      {R"("a\"b" c)", {"a\"b", "c"}},
-      {R"("a\n\t\qb\g" c)", {"a\n\tqbg", "c"}},
-
-      // Escape with the hex digits
-      {R"(\x61 \x62 \x63)", {R"(\x61)", R"(\x62)", R"(\x63)"}},
-      {R"("a \x61\x62" "\x63")", {"a ab", "c"}},
-      // '\' will be removed from '\xT0' because it's not v alid hex digit and a valid escape sequence
-      {R"("a \xT0\x62" "\x63")", {R"(a xT0b)", "c"}},
-      {R"("a b\x6Fc" "d\x63e")", {"a boc", "dce"}},
-
-  };
-  for (const auto &item : valid_cases) {
-    const std::string &input = item.first;
-    const std::vector<std::string> &expected = item.second;
-    auto result = util::SplitArguments(input);
-    ASSERT_TRUE(result.IsOK());
-    ASSERT_EQ(result.GetValue(), expected);
-  }
-
-  // invalid cases
-  std::map<std::string, std::string> invalid_cases = {
-      {R"(a "b c)", "unclosed quote string"},
-      {R"(a 'b c)", "unclosed quote string"},
-      {R"(a "b' c)", "unclosed quote string"},
-      {R"(a 'b" c)", "unclosed quote string"},
-      {R"(a b 'c\)", "unclosed quote string"},
-      {R"(a b "c\)", "unexpected trailing escape character"},
-      {R"(a b "c"d)", "the closed double quote must be followed by a space"},
-      {R"(a 'b'c)", "the closed single quote must be followed by a space"},
-  };
-  for (const auto &item : invalid_cases) {
-    const std::string &input = item.first;
-    const std::string &expected_error = item.second;
-    auto result = util::SplitArguments(input);
-    ASSERT_FALSE(result.IsOK());
-    ASSERT_EQ(result.Msg(), expected_error);
   }
 }

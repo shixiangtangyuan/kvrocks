@@ -23,7 +23,7 @@
 #include "commands/error_constants.h"
 #include "parse_util.h"
 
-Status ParseRangeLexSpec(const std::string &min, const std::string &max, RangeLexSpec *spec) {
+Status ParseRangeLexSpec(const std::string &min, const std::string &max, RangeLexSpec *spec, bool record_para) {
   if (min == "+" || max == "-") {
     return {Status::NotOK, "min > max"};
   }
@@ -53,6 +53,12 @@ Status ParseRangeLexSpec(const std::string &min, const std::string &max, RangeLe
     }
     spec->max = max.substr(1);
   }
+
+  if (record_para) {
+    spec->para_min = min;
+    spec->para_max = max;
+  }
+
   return Status::OK();
 }
 
@@ -84,7 +90,7 @@ Status ParseRangeScoreSpec(const std::string &min, const std::string &max, Range
     }
     spec->min = strtod(sptr, &eptr);
     if ((eptr && eptr[0] != '\0') || std::isnan(spec->min)) {
-      return {Status::NotOK, "the min isn't double"};
+      return {Status::NotOK, "min or max is not a float"};
     }
   }
 
@@ -98,7 +104,7 @@ Status ParseRangeScoreSpec(const std::string &min, const std::string &max, Range
     }
     spec->max = strtod(sptr, &eptr);
     if ((eptr && eptr[0] != '\0') || std::isnan(spec->max)) {
-      return {Status::NotOK, "the max isn't double"};
+      return {Status::NotOK, "min or max is not a float"};
     }
   }
   return Status::OK();

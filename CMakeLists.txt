@@ -16,56 +16,50 @@
 # under the License.
 
 cmake_minimum_required(VERSION 3.16)
-project(kvrocks
+project(datanode
         DESCRIPTION "NoSQL which is based on RocksDB and compatible with the Redis protocol"
-        LANGUAGES C CXX)
-
-set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+        LANGUAGES CXX)
 
 option(DISABLE_JEMALLOC "disable use of the jemalloc library" OFF)
 option(ENABLE_ASAN "enable address sanitizer" OFF)
 option(ENABLE_TSAN "enable thread sanitizer" OFF)
-option(ENABLE_UBSAN "enable undefined behavior sanitizer" OFF)
 option(ASAN_WITH_LSAN "enable leak sanitizer while address sanitizer is enabled" ON)
-option(ENABLE_STATIC_LIBSTDCXX "link kvrocks with static library of libstd++ instead of shared library" ON)
-option(ENABLE_LUAJIT "enable use of luaJIT instead of lua" ON)
+option(ENABLE_STATIC_LIBSTDCXX "link datanode with static library of libstd++ instead of shared library" ON)
+option(ENABLE_LUAJIT "enable use of luaJIT instead of lua" OFF)
 option(ENABLE_OPENSSL "enable openssl to support tls connection" OFF)
-option(ENABLE_LTO "enable link-time optimization" ON)
-set(SYMBOLIZE_BACKEND "" CACHE STRING "symbolization backend library for cpptrace (libbacktrace, libdwarf, or empty)")
+option(ENABLE_IPO "enable interprocedural optimization" ON)
+option(ENABLE_UNWIND "enable libunwind in glog" ON)
+option(ENABLE_SPEEDB "enable speedb instead of rocksdb" OFF)
+option(ENABLE_COVERAGE "enable coverage" OFF)
+option(USE_PINNABLE_SLICE "enable use of pinnable slice optimization" OFF)
 set(PORTABLE 0 CACHE STRING "build a portable binary (disable arch-specific optimizations)")
-# TODO: set ENABLE_NEW_ENCODING to ON when we are ready
-option(ENABLE_NEW_ENCODING "enable new encoding (#1033) for storing 64bit size and expire time in milliseconds" ON)
-
-# to save build time in debug mode
-if (CMAKE_BUILD_TYPE STREQUAL "Debug")
-    set(ENABLE_LTO OFF)
-endif()
 
 if (CMAKE_VERSION VERSION_GREATER_EQUAL "3.24.0")
     cmake_policy(SET CMP0135 NEW)
 endif()
 
+find_package(Backtrace REQUIRED)
+# find_package(benchmark REQUIRED)
+
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 8)
-        message(FATAL_ERROR "It is expected to build kvrocks with GCC 8 or above")
+    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 7)
+        message(FATAL_ERROR "It is expected to build datanode with GCC 7 or above")
     endif()
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)
-        message(FATAL_ERROR "It is expected to build kvrocks with Clang 9 or above")
+    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 5)
+        message(FATAL_ERROR "It is expected to build datanode with Clang 5 or above")
     endif()
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
-    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 11)
-        message(FATAL_ERROR "It is expected to build kvrocks with Xcode toolchains 11 or above")
+    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 10)
+        message(FATAL_ERROR "It is expected to build datanode with Xcode toolchains 10 or above")
     endif()
 else()
     message(WARNING "The compiler you are currently using is not officially supported,
-        so you can try switching to GCC>=8 or Clang>=8 if you encounter problems")
+        so you can try switching to GCC>=7 or Clang>=5 if you encounter problems")
 endif()
 
 if(CMAKE_GENERATOR STREQUAL "Ninja")
     set(MAKE_COMMAND make)
-    set(NINJA_MAKE_JOBS 4 CACHE STRING "specify concurrent level while ninja calling make")
-    set(NINJA_MAKE_JOBS_FLAG -j${NINJA_MAKE_JOBS})
 else()
     set(MAKE_COMMAND $(MAKE))
 endif()
@@ -98,33 +92,6 @@ if(ENABLE_ASAN)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address")
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address")
 endif()
-
-# Copied from https://github.com/apache/arrow/blob/main/cpp/cmake_modules/san-config.cmake
-#
-# Flag to enable clang undefined behavior sanitizer
-# We explicitly don't enable all of the sanitizer flags:
-# - disable 'vptr' because of RTTI issues across shared libraries (?)
-# - disable 'alignment' because unaligned access is really OK on Nehalem and we do it
-#   all over the place.
-# - disable 'function' because it appears to give a false positive
-#   (https://github.com/google/sanitizers/issues/911)
-# - disable 'float-divide-by-zero' on clang, which considers it UB
-#   (https://bugs.llvm.org/show_bug.cgi?id=17000#c1)
-#   Note: GCC does not support the 'function' flag.
-if(ENABLE_UBSAN)
-    if(CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=undefined -fno-sanitize=alignment,vptr,function,float-divide-by-zero")
-        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=undefined -fno-sanitize=alignment,vptr,function,float-divide-by-zero")
-    elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "5.1")
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=undefined -fno-sanitize=alignment,vptr")
-        set(CMAKE_C_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=undefined -fno-sanitize=alignment,vptr")
-    else()
-        message(FATAL_ERROR "Cannot use UBSAN without clang or gcc >= 5.1")
-    endif()
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=undefined")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-sanitize-recover=all")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fno-sanitize-recover=all")
-endif()
 if(ENABLE_TSAN)
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=thread")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=thread")
@@ -141,7 +108,7 @@ endif()
 
 if (CMAKE_HOST_APPLE)
     set(DISABLE_JEMALLOC ON)
-    set(ENABLE_LTO OFF)
+    set(ENABLE_IPO OFF)
 endif ()
 
 if(NOT DISABLE_JEMALLOC)
@@ -156,31 +123,36 @@ if(ENABLE_OPENSSL)
 endif()
 
 include(cmake/gtest.cmake)
+# include(cmake/benchmark.cmake)
+include(cmake/glog.cmake)
 include(cmake/snappy.cmake)
 include(cmake/lz4.cmake)
 include(cmake/zlib.cmake)
 include(cmake/zstd.cmake)
 include(cmake/tbb.cmake)
-include(cmake/rocksdb.cmake)
+if(ENABLE_SPEEDB)
+    include(cmake/speedb.cmake)
+else()
+    include(cmake/rocksdb.cmake)
+endif()
 include(cmake/libevent.cmake)
 include(cmake/fmt.cmake)
-include(cmake/spdlog.cmake)
 include(cmake/jsoncons.cmake)
 include(cmake/xxhash.cmake)
 include(cmake/span.cmake)
-include(cmake/trie.cmake)
-include(cmake/pegtl.cmake)
-include(cmake/rangev3.cmake)
-include(cmake/cpptrace.cmake)
 
 if (ENABLE_LUAJIT)
     include(cmake/luajit.cmake)
 else()
     include(cmake/lua.cmake)
 endif()
+include(cmake/grpc.cmake)
+include(cmake/kvproto.cmake)
 
 find_package(Threads REQUIRED)
 
+list(APPEND EXTERNAL_LIBS gtest_main)
+list(APPEND EXTERNAL_LIBS glog)
 list(APPEND EXTERNAL_LIBS snappy)
 list(APPEND EXTERNAL_LIBS rocksdb_with_headers)
 list(APPEND EXTERNAL_LIBS event_with_headers)
@@ -188,7 +160,9 @@ list(APPEND EXTERNAL_LIBS lz4)
 list(APPEND EXTERNAL_LIBS zstd)
 list(APPEND EXTERNAL_LIBS zlib_with_headers)
 list(APPEND EXTERNAL_LIBS fmt)
-list(APPEND EXTERNAL_LIBS spdlog)
+if (ENABLE_COVERAGE)
+    list(APPEND EXTERNAL_LIBS gcov)
+endif()
 if (ENABLE_LUAJIT)
     list(APPEND EXTERNAL_LIBS luajit)
 else()
@@ -203,10 +177,19 @@ list(APPEND EXTERNAL_LIBS Threads::Threads)
 list(APPEND EXTERNAL_LIBS ${Backtrace_LIBRARY})
 list(APPEND EXTERNAL_LIBS xxhash)
 list(APPEND EXTERNAL_LIBS span-lite)
-list(APPEND EXTERNAL_LIBS tsl_hat_trie)
-list(APPEND EXTERNAL_LIBS pegtl)
-list(APPEND EXTERNAL_LIBS range-v3)
-list(APPEND EXTERNAL_LIBS cpptrace::cpptrace)
+list(APPEND EXTERNAL_LIBS libprotobuf grpc++_reflection grpc++)
+list(APPEND EXTERNAL_LIBS rpc-status)
+if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  list(APPEND EXTERNAL_LIBS -Wl,--whole-archive kvproto -Wl,--no-whole-archive)
+else()
+  list(APPEND EXTERNAL_LIBS kvproto)
+endif()
+
+if(ENABLE_COVERAGE)
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} --coverage -g -O0")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} --coverage -g -O0")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -coverage -lgcov")
+endif()
 
 # Add git sha to version.h
 find_package(Git REQUIRED)
@@ -237,7 +220,7 @@ if ((CMAKE_CXX_COMPILER_ID STREQUAL "GNU") OR (CMAKE_CXX_COMPILER_ID STREQUAL "C
     endif()
 endif()
 
-# kvrocks objects target
+# datanode objects target
 file(GLOB_RECURSE KVROCKS_SRCS src/*.cc)
 list(FILTER KVROCKS_SRCS EXCLUDE REGEX src/cli/main.cc)
 
@@ -246,17 +229,7 @@ add_library(kvrocks_objs OBJECT ${KVROCKS_SRCS})
 target_include_directories(kvrocks_objs PUBLIC src src/common src/vendor ${PROJECT_BINARY_DIR} ${Backtrace_INCLUDE_DIR})
 target_compile_features(kvrocks_objs PUBLIC cxx_std_17)
 target_compile_options(kvrocks_objs PUBLIC -Wall -Wpedantic -Wsign-compare -Wreturn-type -fno-omit-frame-pointer)
-target_compile_options(kvrocks_objs PUBLIC -Werror=unused-parameter)
-target_compile_options(kvrocks_objs PUBLIC -Werror=unused-result)
-
-# disable unused-variable check on GCC < 8 due to the structure bindings
-# https://gcc.gnu.org/bugzilla/show_bug.cgi?format=multiple&id=81767
-if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 8)
-    target_compile_options(kvrocks_objs PUBLIC -Wno-error=unused-variable)
-else()
-    target_compile_options(kvrocks_objs PUBLIC -Werror=unused-variable)
-endif()
-
+target_compile_options(kvrocks_objs PUBLIC -Werror=unused-result -Werror=unused-variable)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(kvrocks_objs PUBLIC -Wno-pedantic)
 elseif((CMAKE_CXX_COMPILER_ID STREQUAL "Clang") OR (CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang"))
@@ -264,22 +237,19 @@ elseif((CMAKE_CXX_COMPILER_ID STREQUAL "Clang") OR (CMAKE_CXX_COMPILER_ID STREQU
 endif()
 target_link_libraries(kvrocks_objs PUBLIC -fno-omit-frame-pointer)
 target_link_libraries(kvrocks_objs PUBLIC ${EXTERNAL_LIBS})
-target_compile_definitions(kvrocks_objs PUBLIC KVROCKS_STORAGE_ENGINE=RocksDB)
 if(ENABLE_OPENSSL)
     target_compile_definitions(kvrocks_objs PUBLIC ENABLE_OPENSSL)
 endif()
-if(ENABLE_NEW_ENCODING)
-    target_compile_definitions(kvrocks_objs PUBLIC METADATA_ENCODING_VERSION=1)
-else()
-    target_compile_definitions(kvrocks_objs PUBLIC METADATA_ENCODING_VERSION=0)
+if(USE_PINNABLE_SLICE)
+    target_compile_definitions(kvrocks_objs PUBLIC USE_PINNABLE_SLICE)
 endif()
 
 # disable LTO on GCC <= 9 due to an ICE
 if((CMAKE_CXX_COMPILER_ID STREQUAL "GNU") AND (CMAKE_CXX_COMPILER_VERSION VERSION_LESS 10))
-    set(ENABLE_LTO OFF)
+    set(ENABLE_IPO OFF)
 endif()
 
-if(ENABLE_LTO)
+if(ENABLE_IPO)
     include(CheckIPOSupported)
     check_ipo_supported(RESULT ipo_result OUTPUT ipo_output LANGUAGES CXX)
 
@@ -289,23 +259,43 @@ if(ENABLE_LTO)
             target_link_libraries(kvrocks_objs PUBLIC "-fuse-ld=lld")
         endif()
     else()
-        message(WARNING "LTO is not supported: ${ipo_output}")
+        message(WARNING "IPO is not supported: ${ipo_output}")
     endif()
 endif()
 
-# kvrocks main target
-add_executable(kvrocks src/cli/main.cc)
-target_link_libraries(kvrocks PRIVATE kvrocks_objs ${EXTERNAL_LIBS})
+# datanode main target
+add_executable(datanode src/cli/main.cc)
+target_link_libraries(datanode PRIVATE kvrocks_objs ${EXTERNAL_LIBS})
 
-# kvrocks2redis sync tool
-file(GLOB KVROCKS2REDIS_SRCS utils/kvrocks2redis/*.cc)
-add_executable(kvrocks2redis ${KVROCKS2REDIS_SRCS})
+# # kvrocks2redis sync tool
+# file(GLOB KVROCKS2REDIS_SRCS utils/kvrocks2redis/*.cc)
+# add_executable(kvrocks2redis ${KVROCKS2REDIS_SRCS})
+# target_link_libraries(kvrocks2redis PRIVATE kvrocks_objs ${EXTERNAL_LIBS})
 
-target_link_libraries(kvrocks2redis PRIVATE kvrocks_objs ${EXTERNAL_LIBS})
-
-# kvrocks unit tests
+# datanode unit tests
 file(GLOB_RECURSE TESTS_SRCS tests/cppunit/*.cc)
 add_executable(unittest ${TESTS_SRCS})
 target_include_directories(unittest PRIVATE tests/cppunit)
 
-target_link_libraries(unittest PRIVATE kvrocks_objs gtest_main gmock ${EXTERNAL_LIBS})
+target_link_libraries(unittest PRIVATE kvrocks_objs gmock ${EXTERNAL_LIBS})
+
+# datanode benchmarks
+# file(GLOB_RECURSE BENCHMARK_SRCS tests/benchmark/*.cc)
+# add_executable(benchmarktest ${BENCHMARK_SRCS})
+# target_include_directories(benchmarktest PRIVATE tests/benchmark)
+# target_link_libraries(benchmarktest
+#   PRIVATE
+#     benchmark::benchmark
+#     benchmark::benchmark_main
+#     pthread
+# )
+# target_link_libraries(benchmarktest PRIVATE kvrocks_objs gmock ${EXTERNAL_LIBS})
+
+add_executable(rpc_cluster_client rpc/rpc_cluster_client.cc)
+target_link_libraries(rpc_cluster_client ${EXTERNAL_LIBS})
+
+add_executable(rpc_cluster_server rpc/rpc_cluster_server.cc)
+target_link_libraries(rpc_cluster_server ${EXTERNAL_LIBS})
+
+add_executable(rpc_cluster_client_ha rpc/rpc_cluster_client_ha.cc)
+target_link_libraries(rpc_cluster_client_ha ${EXTERNAL_LIBS})

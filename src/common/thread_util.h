@@ -20,8 +20,6 @@
 
 #pragma once
 
-#include <signal.h>
-
 #include <system_error>
 #include <thread>
 
@@ -36,15 +34,19 @@ template <typename F>
 StatusOr<std::thread> CreateThread(const char *name, F f) {
   try {
     return std::thread([name, f = std::move(f)] {
-      // Block SIGTERM and SIGINT signals in this thread,
-      // the signal should be handled by the main thread or a dedicated thread.
-      sigset_t signal_set;
-      sigemptyset(&signal_set);
-      sigaddset(&signal_set, SIGTERM);
-      sigaddset(&signal_set, SIGINT);
-      pthread_sigmask(SIG_BLOCK, &signal_set, nullptr);
-
       ThreadSetName(name);
+      f();
+    });
+  } catch (const std::system_error &e) {
+    return {Status::NotOK, fmt::format("thread '{}' cannot be started: {}", name, e.what())};
+  }
+}
+
+template <typename F>
+StatusOr<std::unique_ptr<std::thread>> MakeUniqueThread(std::string name, F f) {
+  try {
+    return std::make_unique<std::thread>([name, f = std::move(f)] {
+      ThreadSetName(name.data());
       f();
     });
   } catch (const std::system_error &e) {

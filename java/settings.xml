@@ -1,0 +1,131 @@
+<?xml version="1.0" encoding="UTF-8"?>
+ 
+<!-- Licensed to the Apache Software Foundation (ASF) under one or more contributor
+    license agreements. See the NOTICE file distributed with this work for additional
+    information regarding copyright ownership. The ASF licenses this file to
+    you under the Apache License, Version 2.0 (the "License"); you may not use
+    this file except in compliance with the License. You may obtain a copy of
+    the License at http://www.apache.org/licenses/LICENSE-2.0 Unless required
+    by applicable law or agreed to in writing, software distributed under the
+    License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS
+    OF ANY KIND, either express or implied. See the License for the specific
+    language governing permissions and limitations under the License. -->
+ 
+ 
+<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0 http://maven.apache.org/xsd/settings-1.0.0.xsd">
+     
+    <pluginGroups>
+        <!-- pluginGroup | Specifies a further group identifier to use for plugin
+            lookup. <pluginGroup>com.your.plugins</pluginGroup> -->
+    </pluginGroups>
+ 
+    <proxies>
+        <!-- proxy | Specification for one proxy, to be used in connecting to the
+            network. | <proxy> <id>optional</id> <active>true</active> <protocol>http</protocol>
+            <username>proxyuser</username> <password>proxypass</password> <host>proxy.host.net</host>
+            <port>80</port> <nonProxyHosts>local.net|some.host.com</nonProxyHosts> </proxy> -->
+    </proxies>
+ 
+    <mirrors>
+        <mirror>
+           <id>nexus</id>
+           <mirrorOf>central</mirrorOf>
+           <name>Nexus Mirror</name>
+           <url>https://nexus-repo.idata.shopeemobile.com/repository/maven-public</url>
+        </mirror>
+        <!--mirror>
+            <id>nexus</id>
+            <mirrorOf>*,!archetype</mirrorOf>
+            <name>Nexus Mirror</name>
+            <url>https://nexus-repo.idata.shopeemobile.com/repository/maven-public</url>
+        </mirror-->
+    </mirrors>
+    <profiles>
+        <profile>
+            <id>nexus</id>
+            <repositories>
+                <repository>
+                    <id>nexus-pub</id>
+                    <name>local private nexus</name>
+                    <url>https://nexus-repo.idata.shopeemobile.com/repository/maven-public</url>
+                    <releases>
+                        <enabled>true</enabled>
+                        <checksumPolicy>never</checksumPolicy>
+                    </releases>
+                    <snapshots>
+                        <enabled>false</enabled>
+                        <checksumPolicy>never</checksumPolicy>
+                    </snapshots>
+                </repository>
+                <repository>
+                    <id>nexus-rel</id>
+                    <name>local private nexus</name>
+                    <url>https://nexus-repo.idata.shopeemobile.com/repository/maven-releases</url>
+                    <releases>
+                        <enabled>true</enabled>
+                        <checksumPolicy>never</checksumPolicy>
+                    </releases>
+                    <snapshots>
+                        <enabled>false</enabled>
+                    </snapshots>
+                </repository>
+                <repository>
+                    <id>nexus-snap</id>
+                    <name>local private nexus</name>
+                    <url>https://nexus-repo.idata.shopeemobile.com/repository/maven-snapshots</url>
+                    <releases>
+                        <enabled>false</enabled>
+                    </releases>
+                    <snapshots>
+                        <enabled>true</enabled>
+                        <checksumPolicy>never</checksumPolicy>
+                    </snapshots>
+                </repository>
+ 
+            </repositories>
+            <pluginRepositories>
+                <pluginRepository>
+                    <id>nexus-plg-pub</id>
+                    <name>local private nexus</name>
+                    <url>https://nexus-repo.idata.shopeemobile.com/repository/maven-public</url>
+                    <releases>
+                        <enabled>true</enabled>
+                        <checksumPolicy>never</checksumPolicy>
+                    </releases>
+                    <snapshots>
+                        <enabled>false</enabled>
+                    </snapshots>
+                </pluginRepository>
+                <pluginRepository>
+                    <id>nexus-plg-snap</id>
+                    <name>local private nexus</name>
+                    <url>https://nexus-repo.idata.shopeemobile.com/repository/maven-snapshots</url>
+                    <releases>
+                        <enabled>false</enabled>
+                    </releases>
+                    <snapshots>
+                        <enabled>true</enabled>
+                        <checksumPolicy>never</checksumPolicy>
+                    </snapshots>
+                </pluginRepository>
+            </pluginRepositories>
+        </profile>
+    </profiles>
+    <activeProfiles>
+        <activeProfile>nexus</activeProfile>
+    </activeProfiles>
+    <servers>
+        <server>
+            <id>nexus-releases</id>
+            <username>de-backend</username>
+            <password>eRcL6yqMwb3f</password>
+        </server>
+        <server>
+            <id>nexus-snapshots</id>
+            <username>de-backend</username>
+            <password>eRcL6yqMwb3f</password>
+        </server>
+    </servers>
+</settings>

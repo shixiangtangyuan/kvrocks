@@ -33,20 +33,19 @@ class CommandPush : public Commander {
  public:
   CommandPush(bool create_if_missing, bool left) : left_(left), create_if_missing_(create_if_missing) {}
 
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
     std::vector<Slice> elems;
     for (size_t i = 2; i < args_.size(); i++) {
       elems.emplace_back(args_[i]);
     }
-
+    estimated_subkey_count_ = static_cast<int64_t>(elems.size());
     uint64_t ret = 0;
     rocksdb::Status s;
-    redis::List list_db(srv->storage, conn->GetNamespace());
-
+    redis::List list_db(storage, conn->GetNamespace());
     if (create_if_missing_) {
-      s = list_db.Push(ctx, args_[1], elems, left_, &ret);
+      s = list_db.Push(args_[1], elems, left_, &ret);
     } else {
-      s = list_db.PushX(ctx, args_[1], elems, left_, &ret);
+      s = list_db.PushX(args_[1], elems, left_, &ret);
     }
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
@@ -110,31 +109,31 @@ class CommandPop : public Commander {
     return Status::OK();
   }
 
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
-    redis::List list_db(srv->storage, conn->GetNamespace());
-
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
+    redis::List list_db(storage, conn->GetNamespace());
     if (with_count_) {
       std::vector<std::string> elems;
-      auto s = list_db.PopMulti(ctx, args_[1], left_, count_, &elems);
+      auto s = list_db.PopMulti(args_[1], left_, count_, &elems);
       if (!s.ok() && !s.IsNotFound()) {
         return {Status::RedisExecErr, s.ToString()};
       }
+      estimated_subkey_count_ = static_cast<int64_t>(elems.size());
 
       if (s.IsNotFound()) {
-        *output = conn->NilArray();
+        *output = redis::MultiLen(-1);
       } else {
-        *output = conn->MultiBulkString(elems);
+        *output = redis::MultiBulkString(elems);
       }
     } else {
       std::string elem;
-      auto s = list_db.Pop(ctx, args_[1], left_, &elem);
+      auto s = list_db.Pop(args_[1], left_, &elem);
       if (!s.ok() && !s.IsNotFound()) {
         return {Status::RedisExecErr, s.ToString()};
       }
-
       if (s.IsNotFound()) {
-        *output = conn->NilString();
+        *output = redis::NilString();
       } else {
+        estimated_subkey_count_ = 1;
         *output = redis::BulkString(elem);
       }
     }
@@ -194,17 +193,17 @@ class CommandLMPop : public Commander {
     return Status::OK();
   }
 
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
-    redis::List list_db(srv->storage, conn->GetNamespace());
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
+    redis::List list_db(storage, conn->GetNamespace());
 
     std::vector<std::string> elems;
     std::string chosen_key;
-
     for (auto &key : keys_) {
-      auto s = list_db.PopMulti(ctx, key, left_, count_, &elems);
+      auto s = list_db.PopMulti(key, left_, count_, &elems);
       if (!s.ok() && !s.IsNotFound()) {
         return {Status::RedisExecErr, s.ToString()};
       }
+      estimated_subkey_count_ += static_cast<int64_t>(elems.size());
       if (!elems.empty()) {
         chosen_key = key;
         break;
@@ -212,9 +211,9 @@ class CommandLMPop : public Commander {
     }
 
     if (elems.empty()) {
-      *output = conn->NilString();
+      *output = redis::NilString();
     } else {
-      std::string elems_bulk = conn->MultiBulkString(elems);
+      std::string elems_bulk = redis::MultiBulkString(elems);
       *output = redis::Array({redis::BulkString(chosen_key), std::move(elems_bulk)});
     }
 
@@ -237,251 +236,6 @@ class CommandLMPop : public Commander {
   std::vector<std::string> keys_;
 };
 
-class CommandBPop : public BlockingCommander {
- public:
-  explicit CommandBPop(bool left) : left_(left) {}
-
-  CommandBPop(const CommandBPop &) = delete;
-  CommandBPop &operator=(const CommandBPop &) = delete;
-
-  ~CommandBPop() override = default;
-
-  Status Parse(const std::vector<std::string> &args) override {
-    auto parse_result = ParseFloat(args[args.size() - 1]);
-    if (!parse_result) {
-      return {Status::RedisParseErr, errTimeoutIsNotFloat};
-    }
-
-    if (*parse_result < 0) {
-      return {Status::RedisParseErr, "timeout should not be negative"};
-    }
-
-    timeout_ = static_cast<int64_t>(*parse_result * 1000 * 1000);
-
-    keys_ = std::vector<std::string>(args.begin() + 1, args.end() - 1);
-    return Commander::Parse(args);
-  }
-
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
-    srv_ = srv;
-    InitConnection(conn);
-
-    auto s = TryPopFromList(ctx);
-    if (s.ok() || !s.IsNotFound()) {
-      return Status::OK();  // error has already output in TryPopFromList
-    }
-
-    return StartBlocking(timeout_, output);
-  }
-
-  void BlockKeys() override {
-    for (const auto &key : keys_) {
-      srv_->BlockOnKey(key, conn_);
-    }
-  }
-
-  void UnblockKeys() override {
-    for (const auto &key : keys_) {
-      srv_->UnblockOnKey(key, conn_);
-    }
-  }
-
-  rocksdb::Status TryPopFromList(engine::Context &ctx) {
-    redis::List list_db(srv_->storage, conn_->GetNamespace());
-    std::string elem;
-    const std::string *last_key_ptr = nullptr;
-    rocksdb::Status s;
-    for (const auto &key : keys_) {
-      last_key_ptr = &key;
-      s = list_db.Pop(ctx, key, left_, &elem);
-      if (s.ok() || !s.IsNotFound()) {
-        break;
-      }
-    }
-
-    if (s.ok()) {
-      if (!last_key_ptr) {
-        conn_->Reply(conn_->MultiBulkString({"", ""}));
-      } else {
-        conn_->GetServer()->UpdateWatchedKeysManually({*last_key_ptr});
-        conn_->Reply(conn_->MultiBulkString({*last_key_ptr, std::move(elem)}));
-      }
-    } else if (!s.IsNotFound()) {
-      conn_->Reply(redis::Error({Status::NotOK, s.ToString()}));
-    }
-
-    return s;
-  }
-
-  MultiLockGuard GetLocks() override {
-    std::vector<std::string> lock_keys;
-    lock_keys.reserve(keys_.size());
-    for (const auto &key : keys_) {
-      auto ns_key = ComposeNamespaceKey(conn_->GetNamespace(), key, srv_->storage->IsSlotIdEncoded());
-      lock_keys.emplace_back(std::move(ns_key));
-    }
-    return MultiLockGuard(srv_->storage->GetLockManager(), lock_keys);
-  }
-
-  bool OnBlockingWrite() override {
-    engine::Context ctx(srv_->storage);
-    auto s = TryPopFromList(ctx);
-    return !s.IsNotFound();
-  }
-
-  std::string NoopReply(const Connection *conn) override { return conn->NilString(); }
-
- private:
-  bool left_ = false;
-  int64_t timeout_ = 0;  // microseconds
-  std::vector<std::string> keys_;
-  Server *srv_ = nullptr;
-};
-
-class CommandBLPop : public CommandBPop {
- public:
-  CommandBLPop() : CommandBPop(true) {}
-};
-
-class CommandBRPop : public CommandBPop {
- public:
-  CommandBRPop() : CommandBPop(false) {}
-};
-
-class CommandBLMPop : public BlockingCommander {
- public:
-  CommandBLMPop() = default;
-  CommandBLMPop(const CommandBLMPop &) = delete;
-  CommandBLMPop &operator=(const CommandBLMPop &) = delete;
-
-  ~CommandBLMPop() override = default;
-
-  // format: BLMPOP timeout #numkeys key0 [key1 ...] <LEFT | RIGHT> [COUNT count]
-  Status Parse(const std::vector<std::string> &args) override {
-    CommandParser parser(args, 1);
-
-    auto timeout = GET_OR_RET(parser.TakeFloat());
-    timeout_ = static_cast<int64_t>(timeout * 1000 * 1000);
-
-    auto num_keys = GET_OR_RET(parser.TakeInt<uint32_t>());
-    keys_.clear();
-    keys_.reserve(num_keys);
-    for (uint32_t i = 0; i < num_keys; ++i) {
-      keys_.emplace_back(GET_OR_RET(parser.TakeStr()));
-    }
-
-    auto left_or_right = util::ToLower(GET_OR_RET(parser.TakeStr()));
-    if (left_or_right == "left") {
-      left_ = true;
-    } else if (left_or_right == "right") {
-      left_ = false;
-    } else {
-      return {Status::RedisParseErr, errInvalidSyntax};
-    }
-
-    while (parser.Good()) {
-      if (parser.EatEqICase("count") && count_ == static_cast<uint32_t>(-1)) {
-        count_ = GET_OR_RET(parser.TakeInt<uint32_t>());
-      } else {
-        return parser.InvalidSyntax();
-      }
-    }
-    if (count_ == static_cast<uint32_t>(-1)) {
-      count_ = 1;
-    }
-
-    return Status::OK();
-  }
-
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
-    srv_ = srv;
-    InitConnection(conn);
-
-    auto s = ExecuteUnblocked(ctx);
-    if (s.ok() || !s.IsNotFound()) {
-      return Status::OK();  // error has already been output
-    }
-
-    return StartBlocking(timeout_, output);
-  }
-
-  rocksdb::Status ExecuteUnblocked(engine::Context &ctx) {
-    redis::List list_db(srv_->storage, conn_->GetNamespace());
-    std::vector<std::string> elems;
-    std::string chosen_key;
-    rocksdb::Status s;
-    for (const auto &key : keys_) {
-      s = list_db.PopMulti(ctx, key, left_, count_, &elems);
-      if (s.ok() && !elems.empty()) {
-        chosen_key = key;
-        break;
-      }
-      if (!s.IsNotFound()) {
-        break;
-      }
-    }
-
-    if (s.ok()) {
-      if (!elems.empty()) {
-        conn_->GetServer()->UpdateWatchedKeysManually({chosen_key});
-        std::string elems_bulk = conn_->MultiBulkString(elems);
-        conn_->Reply(redis::Array({redis::BulkString(chosen_key), std::move(elems_bulk)}));
-      }
-    } else if (!s.IsNotFound()) {
-      conn_->Reply(redis::Error({Status::NotOK, s.ToString()}));
-    }
-
-    return s;
-  }
-
-  void BlockKeys() override {
-    for (const auto &key : keys_) {
-      srv_->BlockOnKey(key, conn_);
-    }
-  }
-
-  void UnblockKeys() override {
-    for (const auto &key : keys_) {
-      srv_->UnblockOnKey(key, conn_);
-    }
-  }
-
-  MultiLockGuard GetLocks() override {
-    std::vector<std::string> lock_keys;
-    lock_keys.reserve(keys_.size());
-    for (const auto &key : keys_) {
-      auto ns_key = ComposeNamespaceKey(conn_->GetNamespace(), key, srv_->storage->IsSlotIdEncoded());
-      lock_keys.emplace_back(std::move(ns_key));
-    }
-    return MultiLockGuard(srv_->storage->GetLockManager(), lock_keys);
-  }
-
-  bool OnBlockingWrite() override {
-    engine::Context ctx(srv_->storage);
-    auto s = ExecuteUnblocked(ctx);
-    return !s.IsNotFound();
-  }
-
-  std::string NoopReply(const Connection *conn) override { return conn->NilString(); }
-
-  static const inline CommandKeyRangeGen keyRangeGen = [](const std::vector<std::string> &args) {
-    CommandKeyRange range;
-    range.first_key = 3;
-    range.key_step = 1;
-    // This parsing would always succeed as this cmd has been parsed before.
-    auto num_key = *ParseInt<int32_t>(args[2], 10);
-    range.last_key = range.first_key + num_key - 1;
-    return range;
-  };
-
- private:
-  bool left_;
-  uint32_t count_ = -1;
-  int64_t timeout_ = 0;  // microseconds
-  std::vector<std::string> keys_;
-  Server *srv_ = nullptr;
-};
-
 class CommandLRem : public Commander {
  public:
   Status Parse(const std::vector<std::string> &args) override {
@@ -494,15 +248,13 @@ class CommandLRem : public Commander {
     return Commander::Parse(args);
   }
 
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
     uint64_t ret = 0;
-    redis::List list_db(srv->storage, conn->GetNamespace());
-
-    auto s = list_db.Rem(ctx, args_[1], count_, args_[3], &ret);
+    redis::List list_db(storage, conn->GetNamespace());
+    auto s = list_db.Rem(args_[1], count_, args_[3], &ret, &estimated_subkey_count_);
     if (!s.ok() && !s.IsNotFound()) {
       return {Status::RedisExecErr, s.ToString()};
     }
-
     *output = redis::Integer(ret);
     return Status::OK();
   }
@@ -524,11 +276,10 @@ class CommandLInsert : public Commander {
     return Commander::Parse(args);
   }
 
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
     int ret = 0;
-    redis::List list_db(srv->storage, conn->GetNamespace());
-
-    auto s = list_db.Insert(ctx, args_[1], args_[3], args_[4], before_, &ret);
+    redis::List list_db(storage, conn->GetNamespace());
+    auto s = list_db.Insert(args_[1], args_[3], args_[4], before_, &ret, &estimated_subkey_count_);
     if (!s.ok() && !s.IsNotFound()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -555,16 +306,16 @@ class CommandLRange : public Commander {
     return Commander::Parse(args);
   }
 
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
-    redis::List list_db(srv->storage, conn->GetNamespace());
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
+    redis::List list_db(storage, conn->GetNamespace());
     std::vector<std::string> elems;
-
-    auto s = list_db.Range(ctx, args_[1], start_, stop_, &elems);
+    auto s = list_db.Range(args_[1], start_, stop_, &elems);
     if (!s.ok() && !s.IsNotFound()) {
       return {Status::RedisExecErr, s.ToString()};
     }
+    estimated_subkey_count_ = static_cast<int64_t>(elems.size());
 
-    *output = ArrayOfBulkStrings(elems);
+    *output = redis::MultiBulkString(elems, false);
     return Status::OK();
   }
 
@@ -574,11 +325,10 @@ class CommandLRange : public Commander {
 
 class CommandLLen : public Commander {
  public:
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
-    redis::List list_db(srv->storage, conn->GetNamespace());
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
+    redis::List list_db(storage, conn->GetNamespace());
     uint64_t count = 0;
-
-    auto s = list_db.Size(ctx, args_[1], &count);
+    auto s = list_db.Size(args_[1], &count);
     if (!s.ok() && !s.IsNotFound()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -600,17 +350,16 @@ class CommandLIndex : public Commander {
     return Commander::Parse(args);
   }
 
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
-    redis::List list_db(srv->storage, conn->GetNamespace());
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
+    redis::List list_db(storage, conn->GetNamespace());
     std::string elem;
-
-    auto s = list_db.Index(ctx, args_[1], index_, &elem);
+    auto s = list_db.Index(args_[1], index_, &elem);
     if (!s.ok() && !s.IsNotFound()) {
       return {Status::RedisExecErr, s.ToString()};
     }
 
     if (s.IsNotFound()) {
-      *output = conn->NilString();
+      *output = redis::NilString();
     } else {
       *output = redis::BulkString(elem);
     }
@@ -633,10 +382,9 @@ class CommandLSet : public Commander {
     return Commander::Parse(args);
   }
 
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
-    redis::List list_db(srv->storage, conn->GetNamespace());
-
-    auto s = list_db.Set(ctx, args_[1], index_, args_[3]);
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
+    redis::List list_db(storage, conn->GetNamespace());
+    auto s = list_db.Set(args_[1], index_, args_[3]);
     if (!s.ok() && !s.IsNotFound()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -645,7 +393,7 @@ class CommandLSet : public Commander {
       return {Status::RedisExecErr, errNoSuchKey};
     }
 
-    *output = redis::RESP_OK;
+    *output = redis::SimpleString("OK");
     return Status::OK();
   }
 
@@ -668,15 +416,13 @@ class CommandLTrim : public Commander {
     return Commander::Parse(args);
   }
 
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
-    redis::List list_db(srv->storage, conn->GetNamespace());
-
-    auto s = list_db.Trim(ctx, args_[1], start_, stop_);
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
+    redis::List list_db(storage, conn->GetNamespace());
+    auto s = list_db.Trim(args_[1], start_, stop_, &estimated_subkey_count_);
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
     }
-
-    *output = redis::RESP_OK;
+    *output = redis::SimpleString("OK");
     return Status::OK();
   }
 
@@ -687,57 +433,20 @@ class CommandLTrim : public Commander {
 
 class CommandRPopLPUSH : public Commander {
  public:
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
-    redis::List list_db(srv->storage, conn->GetNamespace());
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
+    redis::List list_db(storage, conn->GetNamespace());
     std::string elem;
-
-    auto s = list_db.LMove(ctx, args_[1], args_[2], /*src_left=*/false, /*dst_left=*/true, &elem);
+    auto s = list_db.LMove(args_[1], args_[2], /*src_left=*/false, /*dst_left=*/true, &elem);
     if (!s.ok() && !s.IsNotFound()) {
       return {Status::RedisExecErr, s.ToString()};
     }
 
-    *output = s.IsNotFound() ? conn->NilString() : redis::BulkString(elem);
+    *output = s.IsNotFound() ? redis::NilString() : redis::BulkString(elem);
     return Status::OK();
   }
 };
 
 class CommandLMove : public Commander {
- public:
-  Status Parse([[maybe_unused]] const std::vector<std::string> &args) override {
-    auto arg_val = util::ToLower(args_[3]);
-    if (arg_val != "left" && arg_val != "right") {
-      return {Status::RedisParseErr, errInvalidSyntax};
-    }
-
-    src_left_ = arg_val == "left";
-    arg_val = util::ToLower(args_[4]);
-    if (arg_val != "left" && arg_val != "right") {
-      return {Status::RedisParseErr, errInvalidSyntax};
-    }
-
-    dst_left_ = arg_val == "left";
-    return Status::OK();
-  }
-
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
-    redis::List list_db(srv->storage, conn->GetNamespace());
-    std::string elem;
-
-    auto s = list_db.LMove(ctx, args_[1], args_[2], src_left_, dst_left_, &elem);
-    if (!s.ok() && !s.IsNotFound()) {
-      return {Status::RedisExecErr, s.ToString()};
-    }
-
-    *output = s.IsNotFound() ? conn->NilString() : redis::BulkString(elem);
-    return Status::OK();
-  }
-
- private:
-  bool src_left_;
-  bool dst_left_;
-};
-
-class CommandBLMove : public BlockingCommander {
  public:
   Status Parse(const std::vector<std::string> &args) override {
     auto arg_val = util::ToLower(args_[3]);
@@ -750,77 +459,26 @@ class CommandBLMove : public BlockingCommander {
     if (arg_val != "left" && arg_val != "right") {
       return {Status::RedisParseErr, errInvalidSyntax};
     }
+
     dst_left_ = arg_val == "left";
-
-    auto parse_result = ParseFloat(args[args.size() - 1]);
-    if (!parse_result) {
-      return {Status::RedisParseErr, errTimeoutIsNotFloat};
-    }
-    if (*parse_result < 0) {
-      return {Status::RedisParseErr, errTimeoutIsNegative};
-    }
-    timeout_ = static_cast<int64_t>(*parse_result * 1000 * 1000);
-
     return Status::OK();
   }
 
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
-    srv_ = srv;
-    InitConnection(conn);
-
-    redis::List list_db(srv->storage, conn->GetNamespace());
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
+    redis::List list_db(storage, conn->GetNamespace());
     std::string elem;
-
-    auto s = list_db.LMove(ctx, args_[1], args_[2], src_left_, dst_left_, &elem);
+    auto s = list_db.LMove(args_[1], args_[2], src_left_, dst_left_, &elem);
     if (!s.ok() && !s.IsNotFound()) {
       return {Status::RedisExecErr, s.ToString()};
     }
-    if (!elem.empty()) {
-      *output = redis::BulkString(elem);
-      return Status::OK();
-    }
 
-    return StartBlocking(timeout_, output);
+    *output = s.IsNotFound() ? redis::NilString() : redis::BulkString(elem);
+    return Status::OK();
   }
-
-  void BlockKeys() override { srv_->BlockOnKey(args_[1], conn_); }
-
-  void UnblockKeys() override { srv_->UnblockOnKey(args_[1], conn_); }
-
-  MultiLockGuard GetLocks() override {
-    std::vector<std::string> lock_keys{
-        ComposeNamespaceKey(conn_->GetNamespace(), args_[1], srv_->storage->IsSlotIdEncoded())};
-    if (args_[1] != args_[2]) {
-      lock_keys.emplace_back(ComposeNamespaceKey(conn_->GetNamespace(), args_[2], srv_->storage->IsSlotIdEncoded()));
-    }
-    return MultiLockGuard(srv_->storage->GetLockManager(), lock_keys);
-  }
-
-  bool OnBlockingWrite() override {
-    redis::List list_db(srv_->storage, conn_->GetNamespace());
-    std::string elem;
-    engine::Context ctx(srv_->storage);
-    auto s = list_db.LMove(ctx, args_[1], args_[2], src_left_, dst_left_, &elem);
-    if (!s.ok() && !s.IsNotFound()) {
-      conn_->Reply(redis::Error({Status::NotOK, s.ToString()}));
-      return true;
-    }
-
-    bool empty = elem.empty();
-    if (!empty) {
-      conn_->Reply(redis::BulkString(elem));
-    }
-
-    return !empty;
-  }
-
-  std::string NoopReply(const Connection *conn) override { return conn->NilArray(); }
 
  private:
   bool src_left_;
   bool dst_left_;
-  int64_t timeout_ = 0;  // microseconds
-  Server *srv_ = nullptr;
 };
 
 class CommandLPos : public Commander {
@@ -860,11 +518,10 @@ class CommandLPos : public Commander {
     return Status::OK();
   }
 
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
-    redis::List list_db(srv->storage, conn->GetNamespace());
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
+    redis::List list_db(storage, conn->GetNamespace());
     std::vector<int64_t> indexes;
-
-    auto s = list_db.Pos(ctx, args_[1], args_[2], spec_, &indexes);
+    auto s = list_db.Pos(args_[1], args_[2], spec_, &indexes);
     if (!s.ok() && !s.IsNotFound()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -872,7 +529,7 @@ class CommandLPos : public Commander {
     // We return nil or a single value if `COUNT` option is not given.
     if (!spec_.count.has_value()) {
       if (s.IsNotFound() || indexes.empty()) {
-        *output = conn->NilString();
+        *output = redis::NilString();
       } else {
         assert(indexes.size() == 1);
         *output = redis::Integer(indexes[0]);
@@ -885,7 +542,7 @@ class CommandLPos : public Commander {
       for (const auto &index : indexes) {
         values.emplace_back(std::to_string(index));
       }
-      *output = ArrayOfBulkStrings(values);
+      *output = redis::MultiBulkString(values, false);
     }
     return Status::OK();
   }
@@ -894,26 +551,26 @@ class CommandLPos : public Commander {
   PosSpec spec_;
 };
 
-REDIS_REGISTER_COMMANDS(List, MakeCmdAttr<CommandBLPop>("blpop", -3, "write blocking", 1, -2, 1),
-                        MakeCmdAttr<CommandBRPop>("brpop", -3, "write blocking", 1, -2, 1),
-                        MakeCmdAttr<CommandBLMPop>("blmpop", -5, "write blocking", CommandBLMPop::keyRangeGen),
-                        MakeCmdAttr<CommandLIndex>("lindex", 3, "read-only", 1, 1, 1),
-                        MakeCmdAttr<CommandLInsert>("linsert", 5, "write slow", 1, 1, 1),
-                        MakeCmdAttr<CommandLLen>("llen", 2, "read-only", 1, 1, 1),
-                        MakeCmdAttr<CommandLMove>("lmove", 5, "write", 1, 2, 1),
-                        MakeCmdAttr<CommandBLMove>("blmove", 6, "write blocking", 1, 2, 1),
-                        MakeCmdAttr<CommandLPop>("lpop", -2, "write", 1, 1, 1),  //
-                        MakeCmdAttr<CommandLPos>("lpos", -3, "read-only", 1, 1, 1),
-                        MakeCmdAttr<CommandLPush>("lpush", -3, "write", 1, 1, 1),
-                        MakeCmdAttr<CommandLPushX>("lpushx", -3, "write", 1, 1, 1),
-                        MakeCmdAttr<CommandLRange>("lrange", 4, "read-only", 1, 1, 1),
-                        MakeCmdAttr<CommandLRem>("lrem", 4, "write no-dbsize-check slow", 1, 1, 1),
-                        MakeCmdAttr<CommandLSet>("lset", 4, "write", 1, 1, 1),
-                        MakeCmdAttr<CommandLTrim>("ltrim", 4, "write no-dbsize-check", 1, 1, 1),
-                        MakeCmdAttr<CommandLMPop>("lmpop", -4, "write", CommandLMPop::keyRangeGen),
-                        MakeCmdAttr<CommandRPop>("rpop", -2, "write", 1, 1, 1),
-                        MakeCmdAttr<CommandRPopLPUSH>("rpoplpush", 3, "write", 1, 2, 1),
-                        MakeCmdAttr<CommandRPush>("rpush", -3, "write", 1, 1, 1),
-                        MakeCmdAttr<CommandRPushX>("rpushx", -3, "write", 1, 1, 1), )
+REDIS_REGISTER_COMMANDS(
+    // MakeCmdAttr<CommandBLPop>("blpop", -3, "write no-script", 1, -2, 1),
+    // MakeCmdAttr<CommandBRPop>("brpop", -3, "write no-script", 1, -2, 1),
+    // MakeCmdAttr<CommandBLMPop>("blmpop", -5, "write no-script", CommandBLMPop::keyRangeGen),
+    MakeCmdAttr<CommandLIndex>("lindex", 3, "read-only", 1, 1, 1),
+    MakeCmdAttr<CommandLInsert>("linsert", 5, "write", 1, 1, 1),
+    MakeCmdAttr<CommandLLen>("llen", 2, "read-only", 1, 1, 1),
+    // MakeCmdAttr<CommandLMove>("lmove", 5, "write", 1, 2, 1),
+    // MakeCmdAttr<CommandBLMove>("blmove", 6, "write", 1, 2, 1),
+    MakeCmdAttr<CommandLPop>("lpop", -2, "write", 1, 1, 1),
+    // MakeCmdAttr<CommandLPos>("lpos", -3, "read-only", 1, 1, 1),
+    MakeCmdAttr<CommandLPush>("lpush", -3, "write", 1, 1, 1),
+    MakeCmdAttr<CommandLPushX>("lpushx", -3, "write", 1, 1, 1),
+    MakeCmdAttr<CommandLRange>("lrange", 4, "read-only", 1, 1, 1),
+    MakeCmdAttr<CommandLRem>("lrem", 4, "write", 1, 1, 1), MakeCmdAttr<CommandLSet>("lset", 4, "write", 1, 1, 1),
+    MakeCmdAttr<CommandLTrim>("ltrim", 4, "write", 1, 1, 1),
+    // MakeCmdAttr<CommandLMPop>("lmpop", -4, "write", CommandLMPop::keyRangeGen),
+    MakeCmdAttr<CommandRPop>("rpop", -2, "write", 1, 1, 1),
+    // MakeCmdAttr<CommandRPopLPUSH>("rpoplpush", 3, "write", 1, 2, 1),
+    MakeCmdAttr<CommandRPush>("rpush", -3, "write", 1, 1, 1),
+    MakeCmdAttr<CommandRPushX>("rpushx", -3, "write", 1, 1, 1), )
 
 }  // namespace redis

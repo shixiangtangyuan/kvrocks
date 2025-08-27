@@ -19,19 +19,18 @@
 
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter, REMAINDER
 from glob import glob
-import os
+from os import makedirs
 from pathlib import Path
 import re
-import filecmp
 from subprocess import Popen, PIPE
 import sys
-from typing import List, Any, Optional, IO, Tuple
+from typing import List, Any, Optional, TextIO, Tuple
 from shutil import which
 
 CMAKE_REQUIRE_VERSION = (3, 16, 0)
 CLANG_FORMAT_REQUIRED_VERSION = (12, 0, 0)
 CLANG_TIDY_REQUIRED_VERSION = (12, 0, 0)
-GOLANGCI_LINT_REQUIRED_VERSION = (2, 4, 0)
+GOLANGCI_LINT_REQUIRED_VERSION = (1, 49, 0)
 
 SEMVER_REGEX = re.compile(
     r"""
@@ -55,7 +54,6 @@ SEMVER_REGEX = re.compile(
 )
 
 
-# NOTE: the return type should be Popen[str], but Popen is not subscriptable before python 3.9
 def run(*args: str, msg: Optional[str] = None, verbose: bool = False, **kwargs: Any) -> Popen:
     sys.stdout.flush()
     if verbose:
@@ -72,9 +70,9 @@ def run(*args: str, msg: Optional[str] = None, verbose: bool = False, **kwargs: 
     return p
 
 
-def run_pipe(*args: str, msg: Optional[str] = None, verbose: bool = False, **kwargs: Any) -> IO[str]:
+def run_pipe(*args: str, msg: Optional[str] = None, verbose: bool = False, **kwargs: Any) -> TextIO:
     p = run(*args, msg=msg, verbose=verbose, stdout=PIPE, universal_newlines=True, **kwargs)
-    return p.stdout # type: ignore
+    return p.stdout  # type: ignore
 
 
 def find_command(command: str, msg: Optional[str] = None) -> str:
@@ -94,27 +92,9 @@ def check_version(current: str, required: Tuple[int, int, int], prog_name: Optio
 
     return semver
 
-def prepare() -> None:
-    basedir = Path(__file__).parent.absolute()
-    
-    # Install Git hooks
-    hooks = basedir / "dev" / "hooks"
-    git_hooks = basedir / ".git" / "hooks"
 
-    git_hooks.mkdir(exist_ok=True)
-    for hook in hooks.iterdir():
-        dst = git_hooks / hook.name
-        if dst.exists():
-            if filecmp.cmp(hook, dst, shallow=False):
-                print(f"{hook.name} already installed.")
-                continue
-            raise RuntimeError(f"{dst} already exists; please remove it first")
-        else:
-            dst.symlink_to(hook)
-            print(f"{hook.name} installed at {dst}.")
-
-def build(dir: str, jobs: Optional[int], ninja: bool, unittest: bool, compiler: str, cmake_path: str, D: List[str],
-          skip_build: bool, toolchain: Optional[str] = None) -> None:
+def build(dir: str, jobs: Optional[int], coverage: bool, ghproxy: bool, ninja: bool, unittest: bool, benchmarktest: bool, compiler: str, cmake_path: str, D: List[str],
+          skip_build: bool) -> None:
     basedir = Path(__file__).parent.absolute()
 
     find_command("autoconf", msg="autoconf is required to build jemalloc")
@@ -126,11 +106,13 @@ def build(dir: str, jobs: Optional[int], ninja: bool, unittest: bool, compiler: 
     cmake_version = output.read().strip()
     check_version(cmake_version, CMAKE_REQUIRE_VERSION, "CMake")
 
-    os.makedirs(dir, exist_ok=True)
+    makedirs(dir, exist_ok=True)
 
     cmake_options = ["-DCMAKE_BUILD_TYPE=RelWithDebInfo"]
-    if toolchain:
-       cmake_options.append(f"-DCMAKE_TOOLCHAIN_FILE={toolchain}")
+    if coverage:
+        cmake_options.append("-DENABLE_COVERAGE=ON")
+    if ghproxy:
+        cmake_options.append("-DDEPS_FETCH_PROXY=https://mirror.ghproxy.com/")
     if ninja:
         cmake_options.append("-G Ninja")
     if compiler == 'gcc':
@@ -139,15 +121,20 @@ def build(dir: str, jobs: Optional[int], ninja: bool, unittest: bool, compiler: 
         cmake_options += ["-DCMAKE_C_COMPILER=clang", "-DCMAKE_CXX_COMPILER=clang++"]
     if D:
         cmake_options += [f"-D{o}" for o in D]
-
+    cmake_options += ["-DPORTABLE=0"]
+    cmake_options += ["-DCMAKE_CXX_FLAGS=-mavx"]
+    cmake_options += ["-DCMAKE_C_FLAGS=-mavx"]
+    print(cmake_options)
     run(cmake, str(basedir), *cmake_options, verbose=True, cwd=dir)
 
     if skip_build:
         return
 
-    target = ["kvrocks", "kvrocks2redis"]
+    target = ["datanode"]
     if unittest:
         target.append("unittest")
+    if benchmarktest:
+        target.append("benchmarktest")
 
     options = ["--build", "."]
     if jobs is not None:
@@ -172,11 +159,7 @@ def clang_format(clang_format_path: str, fix: bool = False) -> None:
     command = find_command(clang_format_path, msg="clang-format is required")
 
     version_res = run_pipe(command, '--version').read().strip()
-    version_re_res = re.search(r'version\s+((?:\w|\.)+)', version_res)
-    if version_re_res:
-        version_str = version_re_res.group(1)
-    else:
-        raise RuntimeError(f"version not found in `{command} --version`")
+    version_str = re.search(r'version\s+((?:\w|\.)+)', version_res).group(1)
 
     check_version(version_str, CLANG_FORMAT_REQUIRED_VERSION, "clang-format")
 
@@ -197,11 +180,7 @@ def clang_tidy(dir: str, jobs: Optional[int], clang_tidy_path: str, run_clang_ti
     tidy_command = find_command(clang_tidy_path, msg="clang-tidy is required")
 
     version_res = run_pipe(tidy_command, '--version').read().strip()
-    version_re_res = re.search(r'version\s+((?:\w|\.)+)', version_res)
-    if version_re_res:
-        version_str = version_re_res.group(1)
-    else:
-        raise RuntimeError(f"version not found in `{tidy_command} --version`")
+    version_str = re.search(r'version\s+((?:\w|\.)+)', version_res).group(1)
 
     check_version(version_str, CLANG_TIDY_REQUIRED_VERSION, "clang-tidy")
 
@@ -234,11 +213,7 @@ def golangci_lint(golangci_lint_path: str) -> None:
     def get_syspath(sys_path: str) -> Tuple[str, str]:
         golangci_command = find_command(sys_path, msg="golangci-lint is required")
         version_res = run_pipe(golangci_command, '--version').read().strip()
-        version_re_res = re.search(r'version\s+((?:\w|\.)+)', version_res)
-        if version_re_res:
-            version_str = version_re_res.group(1)
-        else:
-            raise RuntimeError(f"version not found in `{golangci_command} --version`")
+        version_str = re.search(r'version\s+((?:\w|\.)+)', version_res).group(1)
         return golangci_command, version_str
 
     def download_package(bindir: str) -> None:
@@ -278,11 +253,11 @@ def package_source(release_version: str, release_candidate_number: Optional[int]
 
     # 1. Git commit and tag
     git = find_command('git', msg='git is required for source packaging')
-    run(git, 'commit', '-a', '-m', f'release: prepare source release apache-kvrocks-{version}')
+    run(git, 'commit', '-a', '-m', f'[source-release] prepare release apache-kvrocks-{version}')
     if release_candidate_number is None:
-        run(git, 'tag', '-a', f'v{version}', '-m', f'release: copy for tag v{version}')
+        run(git, 'tag', '-a', f'v{version}', '-m', f'[source-release] copy for tag v{version}')
     else:
-        run(git, 'tag', '-a', f'v{version}-rc{release_candidate_number}', '-m', f'release: copy for tag v{version}-rc{release_candidate_number}')
+        run(git, 'tag', '-a', f'v{version}-rc{release_candidate_number}', '-m', f'[source-release] copy for tag v{version}-rc{release_candidate_number}')
 
     # 2. Create the source tarball
     folder = f'apache-kvrocks-{version}-src'
@@ -310,12 +285,12 @@ def test_go(dir: str, cli_path: str, rest: List[str]) -> None:
     go = find_command('go', msg='go is required for testing')
     find_command(cli_path, msg='redis-cli is required for testing')
 
-    binpath = Path(dir).absolute() / 'kvrocks'
+    binpath = Path(dir).absolute() / 'datanode'
     basedir = Path(__file__).parent.absolute() / 'tests' / 'gocase'
     workspace = basedir / 'workspace'
 
     args = [
-        'test', '-timeout=1800s', '-bench=.', './...',
+        'test', '-v', '-timeout=1800s', '-bench=.', './...',
         f'-binPath={binpath}',
         f'-cliPath={cli_path}',
         f'-workspace={workspace}',
@@ -377,7 +352,7 @@ if __name__ == '__main__':
     parser_check_golangci_lint.set_defaults(func=golangci_lint)
     parser_check_golangci_lint.add_argument('--golangci-lint-path', default='golangci-lint',
                                    help="path of golangci-lint used to check source")
-    
+
     parser_build = subparsers.add_parser(
         'build',
         description="Build executables to BUILD_DIR [default: build]",
@@ -387,11 +362,14 @@ if __name__ == '__main__':
     parser_build.add_argument('dir', metavar='BUILD_DIR', nargs='?', default='build',
                               help="directory to store cmake-generated and build files")
     parser_build.add_argument('-j', '--jobs', metavar='N', help='execute N build jobs concurrently')
+    parser_build.add_argument('--coverage', default=False, action='store_true', help='build with coverage')
+    parser_build.add_argument('--ghproxy', default=False, action='store_true',
+                              help='use https://mirror.ghproxy.com to fetch dependencies')
     parser_build.add_argument('--ninja', default=False, action='store_true', help='use Ninja to build kvrocks')
     parser_build.add_argument('--unittest', default=False, action='store_true', help='build unittest target')
+    parser_build.add_argument('--benchmarktest', default=False, action='store_true', help='build benchmark target')
     parser_build.add_argument('--compiler', default='auto', choices=('auto', 'gcc', 'clang'),
                               help="compiler used to build kvrocks")
-    parser_build.add_argument('--toolchain', metavar='FILE', help="path to CMake toolchain file for cross-compiling")
     parser_build.add_argument('--cmake-path', default='cmake', help="path of cmake binary used to build kvrocks")
     parser_build.add_argument('-D', action='append', metavar='key=value', help='extra CMake definitions')
     parser_build.add_argument('--skip-build', default=False, action='store_true',
@@ -445,13 +423,6 @@ if __name__ == '__main__':
     parser_test_go.add_argument('--cli-path', default='redis-cli', help="path of redis-cli to test kvrocks")
     parser_test_go.add_argument('rest', nargs=REMAINDER, help="the rest of arguments to forward to go test")
     parser_test_go.set_defaults(func=test_go)
-
-    parser_prepare = subparsers.add_parser(
-        'prepare',
-        description="Prepare scripts such as git hooks",
-        help="Prepare scripts such as git hooks"
-    )
-    parser_prepare.set_defaults(func=prepare)
 
     args = parser.parse_args()
 

@@ -20,6 +20,7 @@
 
 #include "redis_request.h"
 
+#include <glog/logging.h>
 #include <rocksdb/perf_context.h>
 
 #include <chrono>
@@ -28,7 +29,6 @@
 
 #include "cluster/redis_slot.h"
 #include "event_util.h"
-#include "logging.h"
 #include "parse_util.h"
 #include "redis_connection.h"
 #include "redis_reply.h"
@@ -36,7 +36,11 @@
 
 namespace redis {
 
-Status Request::Tokenize(evbuffer *input) {
+const size_t PROTO_INLINE_MAX_SIZE = 16 * 1024L;
+const size_t PROTO_BULK_MAX_SIZE = 512 * 1024L * 1024L;
+const size_t PROTO_MULTI_MAX_SIZE = 1024 * 1024L;
+
+Status Request::Tokenize(evbuffer *input, std::deque<CommandTokens> *commands) {
   size_t pipeline_size = 0;
 
   while (true) {
@@ -54,7 +58,7 @@ Status Request::Tokenize(evbuffer *input) {
 
         if (!line || line.length <= 0) {
           if (pipeline_size > 128) {
-            info("[request] Large pipeline detected: {}", pipeline_size);
+            LOG(INFO) << "Large pipeline detected: " << pipeline_size;
           }
           if (line) {
             continue;
@@ -63,7 +67,7 @@ Status Request::Tokenize(evbuffer *input) {
         }
 
         pipeline_size++;
-        srv_->stats.IncrInboundBytes(line.length);
+        GlobalStatsInstance().IncrInbondBytes(line.length);
         if (line[0] == '*') {
           auto parse_result = ParseInt<int64_t>(std::string(line.get() + 1, line.length - 1), 10);
           if (!parse_result) {
@@ -86,13 +90,9 @@ Status Request::Tokenize(evbuffer *input) {
             return {Status::NotOK, "Protocol error: invalid bulk length"};
           }
 
-          auto arguments = util::SplitArguments(line.get());
-          if (!arguments.IsOK()) {
-            return {Status::NotOK, "Protocol error: " + arguments.Msg()};
-          }
-          tokens_ = std::move(arguments.GetValue());
+          tokens_ = util::Split(std::string(line.get(), line.length), " \t");
           if (tokens_.empty()) continue;
-          commands_.emplace_back(std::move(tokens_));
+          commands->emplace_back(std::move(tokens_));
           state_ = ArrayLen;
         }
         break;
@@ -101,7 +101,7 @@ Status Request::Tokenize(evbuffer *input) {
         UniqueEvbufReadln line(input, EVBUFFER_EOL_CRLF_STRICT);
         if (!line || line.length <= 0) return Status::OK();
 
-        srv_->stats.IncrInboundBytes(line.length);
+        GlobalStatsInstance().IncrInbondBytes(line.length);
         if (line[0] != '$') {
           return {Status::NotOK, "Protocol error: expected '$'"};
         }
@@ -112,7 +112,7 @@ Status Request::Tokenize(evbuffer *input) {
         }
 
         bulk_len_ = *parse_result;
-        if (bulk_len_ > srv_->GetConfig()->proto_max_bulk_len) {
+        if (bulk_len_ > PROTO_BULK_MAX_SIZE) {
           return {Status::NotOK, "Protocol error: invalid bulk length"};
         }
 
@@ -125,11 +125,11 @@ Status Request::Tokenize(evbuffer *input) {
         char *data = reinterpret_cast<char *>(evbuffer_pullup(input, static_cast<ssize_t>(bulk_len_ + 2)));
         tokens_.emplace_back(data, bulk_len_);
         evbuffer_drain(input, bulk_len_ + 2);
-        srv_->stats.IncrInboundBytes(bulk_len_ + 2);
+        GlobalStatsInstance().IncrInbondBytes(bulk_len_ + 2);
         --multi_bulk_len_;
         if (multi_bulk_len_ == 0) {
           state_ = ArrayLen;
-          commands_.emplace_back(std::move(tokens_));
+          commands->emplace_back(std::move(tokens_));
           tokens_.clear();
         } else {
           state_ = BulkLen;

@@ -21,17 +21,20 @@
 #include "worker.h"
 
 #include <event2/util.h>
-#include <unistd.h>
+#include <glog/logging.h>
 
-#include <cstdint>
 #include <stdexcept>
 #include <string>
 
+#include "commands/commander.h"
 #include "event2/bufferevent.h"
+#include "event2/bufferevent_struct.h"
+#include "event2/event.h"
 #include "io_util.h"
-#include "logging.h"
 #include "scope_exit.h"
+#include "stats/stats.h"
 #include "thread_util.h"
+#include "time_util.h"
 
 #ifdef ENABLE_OPENSSL
 #include <event2/bufferevent_ssl.h>
@@ -45,39 +48,82 @@
 #include <sys/un.h>
 
 #include <algorithm>
+#include <list>
 #include <utility>
 
 #include "redis_connection.h"
 #include "redis_request.h"
 #include "server.h"
-#include "storage/scripting.h"
 
-Worker::Worker(Server *srv, Config *config) : srv(srv), base_(event_base_new()) {
-  if (!base_) throw std::runtime_error{"event base failed to be created"};
+Worker::Worker(Server *srv, Config *config) : srv(srv) {
+  if (config->max_dispatch_interval_ms > 0) {
+    struct event_config *cfg = event_config_new();
+    if (!cfg) {
+      LOG(WARNING) << "[worker] Failed to create event config, falling back to default event base creation";
+      base_ = event_base_new();
+    } else {
+      struct timeval max_interval;
+      max_interval.tv_sec = config->max_dispatch_interval_ms / 1000;
+      max_interval.tv_usec = (config->max_dispatch_interval_ms % 1000) * 1000;
 
-  timer_.reset(NewEvent(base_, -1, EV_PERSIST));
-  timeval tm = {10, 0};
-  evtimer_add(timer_.get(), &tm);
-
-  if (config->socket_fd != -1) {
-    if (const Status s = listenFD(config->socket_fd, config->port, config->backlog); !s.IsOK()) {
-      error("[worker] Failed to listen to socket with fd: {}, Error: {}", config->socket_fd, s.Msg());
-      exit(1);
+      if (event_config_set_max_dispatch_interval(cfg, &max_interval, -1, 0) < 0) {
+        LOG(WARNING) << "[worker] Failed to set max dispatch interval (" << config->max_dispatch_interval_ms
+                     << "ms), falling back to default event base creation";
+        event_config_free(cfg);
+        base_ = event_base_new();
+      } else {
+        base_ = event_base_new_with_config(cfg);
+        event_config_free(cfg);
+        if (!base_) {
+          LOG(WARNING)
+              << "[worker] Failed to create event base with config, falling back to default event base creation";
+          base_ = event_base_new();
+        } else {
+          LOG(INFO) << "[worker] Created event base with max dispatch interval: " << config->max_dispatch_interval_ms
+                    << "ms";
+        }
+      }
     }
   } else {
-    const uint32_t ports[3] = {config->port, config->tls_port, 0};
+    base_ = event_base_new();
+  }
 
-    for (const uint32_t *port = ports; *port; ++port) {
-      for (const auto &bind : config->binds) {
-        if (const Status s = listenTCP(bind, *port, config->backlog); !s.IsOK()) {
-          error("[worker] Failed to listen on: {}:{}, Error: {}", bind, *port, s.Msg());
+  if (!base_) throw std::runtime_error{"event base failed to be created"};
+
+  if (event_base_priority_init(base_, 3) < 0) {
+    throw std::runtime_error{"failed to initialize event priorities"};
+  }
+
+  timer_.reset(NewEvent(base_, -1, EV_PERSIST));
+  timeval tm = {0, 3000};  // 3ms
+  evtimer_add(timer_.get(), &tm);
+
+  event_queue_sample_timer_.reset(event_new(base_, -1, EV_PERSIST, eventQueueSampleTimerCB, this));
+  timeval eqtm = {0, 200000};  // 200ms
+  evtimer_add(event_queue_sample_timer_.get(), &eqtm);
+
+  uint32_t ports[3] = {config->port, config->tls_port, 0};
+  auto binds = config->binds;
+
+  // 如果启用了负载均衡，只让第一个worker监听端口
+  // 通过检查worker_threads_的大小来判断是否是第一个worker
+  bool should_listen = true;
+  if (config->worker_load_balance) {
+    should_listen = (srv->GetWorkerCount() == 0);
+  }
+
+  if (should_listen) {
+    for (uint32_t *port = ports; *port; ++port) {
+      for (const auto &bind : binds) {
+        Status s = listenTCP(bind, *port, config->backlog);
+        if (!s.IsOK()) {
+          LOG(ERROR) << "[worker] Failed to listen on: " << bind << ":" << *port << ". Error: " << s.Msg();
           exit(1);
         }
-        info("[worker] Listening on: {}:{}", bind, *port);
+        LOG(INFO) << "[worker] Listening on: " << bind << ":" << *port;
       }
     }
   }
-  lua_ = lua::CreateState();
 }
 
 Worker::~Worker() {
@@ -95,6 +141,7 @@ Worker::~Worker() {
   }
 
   timer_.reset();
+  event_queue_sample_timer_.reset();
   if (rate_limit_group_) {
     bufferevent_rate_limit_group_free(rate_limit_group_);
   }
@@ -102,30 +149,36 @@ Worker::~Worker() {
     ev_token_bucket_cfg_free(rate_limit_group_cfg_);
   }
   event_base_free(base_);
-  lua::DestroyState(lua_);
+  // clear LuaState when worker thread closed
+  {
+    std::stringstream ss;
+    ss << tid_;
+    srv->script_mgr->EraseLuaState(ss.str());
+  }
 }
 
-void Worker::TimerCB(int, [[maybe_unused]] int16_t events) {
-  auto config = srv->GetConfig();
-  if (config->timeout == 0) return;
-  KickoutIdleClients(config->timeout);
+void Worker::eventQueueSampleTimerCB(evutil_socket_t fd, short what, void *arg) {
+  // get active events
+  auto *worker = static_cast<Worker *>(arg);
+  int active_events = event_base_get_num_events(worker->base_, EVENT_BASE_COUNT_ACTIVE);
+  thread_local_metric_array.Record(MetricType::EVENT_QUEUE_SIZE,
+                                   {{"worker_id", std::to_string(thread_local_metric_array.thread_id)}}, active_events);
 }
 
-void Worker::newTCPConnection(evconnlistener *listener, evutil_socket_t fd, [[maybe_unused]] sockaddr *address,
-                              [[maybe_unused]] int socklen) {
+void Worker::newTCPConnection(evconnlistener *listener, evutil_socket_t fd, sockaddr *address, int socklen) {
   int local_port = util::GetLocalPort(fd);  // NOLINT
-  debug("[worker] New connection: fd={} from port: {} thread #{}", fd, local_port, fmt::streamed(tid_));
+  LOG(INFO) << "[worker] New connection: fd=" << fd << " from port: " << local_port << " thread #" << tid_;
 
   auto s = util::SockSetTcpKeepalive(fd, 120);
   if (!s.IsOK()) {
-    error("[worker] Failed to set tcp-keepalive on socket. Error: {}", s.Msg());
+    LOG(ERROR) << "[worker] Failed to set tcp-keepalive on socket. Error: " << s.Msg();
     evutil_closesocket(fd);
     return;
   }
 
   s = util::SockSetTcpNoDelay(fd, 1);
   if (!s.IsOK()) {
-    error("[worker] Failed to set tcp-nodelay on socket. Error: {}", s.Msg());
+    LOG(ERROR) << "[worker] Failed to set tcp-nodelay on socket. Error: " << s.Msg();
     evutil_closesocket(fd);
     return;
   }
@@ -140,7 +193,7 @@ void Worker::newTCPConnection(evconnlistener *listener, evutil_socket_t fd, [[ma
   if (uint32_t(local_port) == srv->GetConfig()->tls_port) {
     ssl = SSL_new(srv->ssl_ctx.get());
     if (!ssl) {
-      error("[worker] Failed to construct SSL structure for new connection: {}", fmt::streamed(SSLErrors{}));
+      LOG(ERROR) << "Failed to construct SSL structure for new connection: " << SSLErrors{};
       evutil_closesocket(fd);
       return;
     }
@@ -154,11 +207,10 @@ void Worker::newTCPConnection(evconnlistener *listener, evutil_socket_t fd, [[ma
   if (!bev) {
     auto socket_err = evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR());
 #ifdef ENABLE_OPENSSL
-    error("[worker] Failed to construct socket for new connection: {}, SSL error: {}", socket_err,
-          fmt::streamed(SSLErrors{}));
+    LOG(ERROR) << "Failed to construct socket for new connection: " << socket_err << ", SSL error: " << SSLErrors{};
     if (ssl) SSL_free(ssl);
 #else
-    error("[worker] Failed to construct socket for new connection: {}", socket_err);
+    LOG(ERROR) << "Failed to construct socket for new connection: " << socket_err;
 #endif
     evutil_closesocket(fd);
     return;
@@ -168,16 +220,44 @@ void Worker::newTCPConnection(evconnlistener *listener, evutil_socket_t fd, [[ma
     bufferevent_openssl_set_allow_dirty_shutdown(bev, 1);
   }
 #endif
-  auto conn = new redis::Connection(bev, this);
-  conn->SetCB(bev);
-  bufferevent_enable(bev, EV_READ);
 
-  s = AddConnection(conn);
-  if (!s.IsOK()) {
-    std::string err_msg = redis::Error({Status::NotOK, s.Msg()});
+  // Set bufferevent max single read/write if configured
+  if (srv->GetConfig()->bufferevent_max_single_write > 0) {
+    bufferevent_set_max_single_write(bev, srv->GetConfig()->bufferevent_max_single_write);
+  }
+  if (srv->GetConfig()->bufferevent_max_single_read > 0) {
+    bufferevent_set_max_single_read(bev, srv->GetConfig()->bufferevent_max_single_read);
+  }
+
+  auto conn = new redis::Connection(bev, this);
+
+  // Check if load balancing is enabled and determine target worker
+  Worker *target_worker = this;
+  if (srv->GetConfig()->worker_load_balance) {
+    target_worker = srv->SelectWorkerWithLeastConnections();
+    if (target_worker && target_worker != this) {
+      // We need to migrate this connection to the selected worker
+      conn->SetOwner(target_worker);
+      // Move bufferevent to target worker's event base
+      bufferevent_disable(bev, EV_WRITE);
+      bufferevent_base_set(target_worker->GetEventBase(), bev);
+      bufferevent_enable(bev, EV_WRITE);
+    }
+  }
+
+  // Set callbacks and enable events on the correct event base
+  conn->SetCB(bev);
+
+  if (event_priority_set(&bev->ev_write, srv->GetConfig()->bufferevent_write_priority) == -1) {
+    LOG(WARNING) << "[worker] Failed to set write priority for connection fd=" << fd;
+  }
+
+  auto add_status = target_worker->AddConnection(conn);
+  if (!add_status.IsOK()) {
+    std::string err_msg = redis::Error("ERR " + add_status.Msg());
     s = util::SockSend(fd, err_msg, ssl);
     if (!s.IsOK()) {
-      warn("[worker] Failed to send error response to socket: {}", s.Msg());
+      LOG(WARNING) << "Failed to send error response to socket: " << s.Msg();
     }
     conn->Close();
     return;
@@ -188,15 +268,16 @@ void Worker::newTCPConnection(evconnlistener *listener, evutil_socket_t fd, [[ma
     conn->SetAddr(ip, port);
   }
 
-  if (rate_limit_group_) {
-    bufferevent_add_to_rate_limit_group(bev, rate_limit_group_);
+  if (target_worker->rate_limit_group_) {
+    bufferevent_add_to_rate_limit_group(bev, target_worker->rate_limit_group_);
   }
+
+  bufferevent_enable(bev, EV_READ);
 }
 
-void Worker::newUnixSocketConnection(evconnlistener *listener, evutil_socket_t fd, [[maybe_unused]] sockaddr *address,
-                                     [[maybe_unused]] int socklen) {
-  debug("[worker] New connection: fd={} from unixsocket: {} thread #{}", fd, srv->GetConfig()->unixsocket,
-        fmt::streamed(tid_));
+void Worker::newUnixSocketConnection(evconnlistener *listener, evutil_socket_t fd, sockaddr *address, int socklen) {
+  LOG(INFO) << "[worker] New connection: fd=" << fd << " from unixsocket: " << srv->GetConfig()->unixsocket
+            << " thread #" << tid_;
   event_base *base = evconnlistener_get_base(listener);
   auto ev_thread_safe_flags =
       BEV_OPT_THREADSAFE | BEV_OPT_DEFER_CALLBACKS | BEV_OPT_UNLOCK_CALLBACKS | BEV_OPT_CLOSE_ON_FREE;
@@ -208,9 +289,10 @@ void Worker::newUnixSocketConnection(evconnlistener *listener, evutil_socket_t f
 
   auto s = AddConnection(conn);
   if (!s.IsOK()) {
-    s = util::SockSend(fd, redis::Error(s));
+    std::string err_msg = redis::Error("ERR " + s.Msg());
+    s = util::SockSend(fd, err_msg);
     if (!s.IsOK()) {
-      warn("[worker] Failed to send error response to socket: {}", s.Msg());
+      LOG(WARNING) << "Failed to send error response to socket: " << s.Msg();
     }
     conn->Close();
     return;
@@ -220,22 +302,6 @@ void Worker::newUnixSocketConnection(evconnlistener *listener, evutil_socket_t f
   if (rate_limit_group_) {
     bufferevent_add_to_rate_limit_group(bev, rate_limit_group_);
   }
-}
-
-Status Worker::listenFD(int fd, uint32_t expected_port, int backlog) {
-  const uint32_t port = util::GetLocalPort(fd);
-  if (port != expected_port) {
-    return {Status::NotOK, "The port of the provided socket fd doesn't match the configured port"};
-  }
-  const int dup_fd = dup(fd);
-  if (dup_fd == -1) {
-    return {Status::NotOK, evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR())};
-  }
-  evconnlistener *lev =
-      NewEvconnlistener<&Worker::newTCPConnection>(base_, LEV_OPT_THREADSAFE | LEV_OPT_CLOSE_ON_FREE, backlog, dup_fd);
-  listen_events_.emplace_back(lev);
-  info("[worker] Listening on dup'ed fd: {}", dup_fd);
-  return Status::OK();
 }
 
 Status Worker::listenTCP(const std::string &host, uint32_t port, int backlog) {
@@ -313,8 +379,9 @@ Status Worker::ListenUnixSocket(const std::string &path, int perm, int backlog) 
 
 void Worker::Run(std::thread::id tid) {
   tid_ = tid;
+  srv->number_of_worker_connections_[tid_] = 0;
   if (event_base_dispatch(base_) != 0) {
-    error("[worker] Failed to run server, err: {}", strerror(errno));
+    LOG(ERROR) << "[worker] Failed to run server, err: " << strerror(errno);
   }
   is_terminated_ = true;
 }
@@ -342,8 +409,8 @@ Status Worker::AddConnection(redis::Connection *c) {
   }
 
   int max_clients = srv->GetConfig()->maxclients;
-  if (srv->IncrClientNum() >= max_clients) {
-    srv->DecrClientNum();
+  if (srv->IncrClientNum(tid_) >= max_clients) {
+    srv->DecrClientNum(tid_);
     return {Status::NotOK, "max number of clients reached"};
   }
 
@@ -362,14 +429,14 @@ redis::Connection *Worker::removeConnection(int fd) {
   if (iter != conns_.end()) {
     conn = iter->second;
     conns_.erase(iter);
-    srv->DecrClientNum();
+    srv->DecrClientNum(tid_);
   }
 
   iter = monitor_conns_.find(fd);
   if (iter != monitor_conns_.end()) {
     conn = iter->second;
     monitor_conns_.erase(iter);
-    srv->DecrClientNum();
+    srv->DecrClientNum(tid_);
     srv->DecrMonitorClientNum();
   }
 
@@ -401,7 +468,7 @@ void Worker::MigrateConnection(Worker *target, redis::Connection *conn) {
     conn->Close();
     return;
   }
-  bufferevent_base_set(target->base_, bev);
+  bufferevent_base_set(target->GetEventBase(), bev);
   conn->SetCB(bev);
   bufferevent_enable(bev, EV_READ | EV_WRITE);
   conn->SetOwner(target);
@@ -426,7 +493,6 @@ void Worker::FreeConnection(redis::Connection *conn) {
 
   removeConnection(conn->GetFD());
   srv->ResetWatchedKeys(conn);
-  srv->CleanupWaitConnection(conn);
   if (rate_limit_group_) {
     bufferevent_remove_from_rate_limit_group(conn->GetBufferEvent());
   }
@@ -442,14 +508,14 @@ void Worker::FreeConnectionByID(int fd, uint64_t id) {
     }
     delete iter->second;
     conns_.erase(iter);
-    srv->DecrClientNum();
+    srv->DecrClientNum(tid_);
   }
 
   iter = monitor_conns_.find(fd);
   if (iter != monitor_conns_.end() && iter->second->GetID() == id) {
     delete iter->second;
     monitor_conns_.erase(iter);
-    srv->DecrClientNum();
+    srv->DecrClientNum(tid_);
     srv->DecrMonitorClientNum();
   }
 }
@@ -486,16 +552,6 @@ void Worker::BecomeMonitorConn(redis::Connection *conn) {
   }
   srv->IncrMonitorClientNum();
   conn->EnableFlag(redis::Connection::kMonitor);
-}
-
-void Worker::QuitMonitorConn(redis::Connection *conn) {
-  {
-    std::lock_guard<std::mutex> guard(conns_mu_);
-    monitor_conns_.erase(conn->GetFD());
-    conns_[conn->GetFD()] = conn;
-  }
-  srv->DecrMonitorClientNum();
-  conn->DisableFlag(redis::Connection::kMonitor);
 }
 
 void Worker::FeedMonitorConns(redis::Connection *conn, const std::string &response) {
@@ -549,13 +605,6 @@ void Worker::KillClient(redis::Connection *self, uint64_t id, const std::string 
   }
 }
 
-void Worker::LuaReset() {
-  auto lua = lua_.exchange(lua::CreateState());
-  lua::DestroyState(lua);
-}
-
-int64_t Worker::GetLuaMemorySize() { return (int64_t)lua_gc(lua_, LUA_GCCOUNT, 0) * 1024; }
-
 void Worker::KickoutIdleClients(int timeout) {
   std::vector<std::pair<int, uint64_t>> to_be_killed_conns;
 
@@ -583,23 +632,28 @@ void Worker::KickoutIdleClients(int timeout) {
   }
 }
 
+void Worker::SetConnUnblocked() {
+  for (auto &it : conns_) {
+    if (it.second->IsBlocked()) it.second->SetUnblocked();
+  }
+}
+
 void WorkerThread::Start() {
   auto s = util::CreateThread("worker", [this] { this->worker_->Run(std::this_thread::get_id()); });
-
   if (s) {
     t_ = std::move(*s);
   } else {
-    error("[worker] Failed to start worker thread, err: {}", s.Msg());
+    LOG(ERROR) << "[worker] Failed to start worker thread, err: " << s.Msg();
     return;
   }
 
-  info("[worker] Thread #{} started", fmt::streamed(t_.get_id()));
+  LOG(INFO) << "[worker] Thread #" << t_.get_id() << " started";
 }
 
 void WorkerThread::Stop(uint32_t wait_seconds) { worker_->Stop(wait_seconds); }
 
 void WorkerThread::Join() {
   if (auto s = util::ThreadJoin(t_); !s) {
-    warn("[worker] {}", s.Msg());
+    LOG(WARNING) << "[worker] " << s.Msg();
   }
 }

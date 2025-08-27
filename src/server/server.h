@@ -20,7 +20,11 @@
 
 #pragma once
 
+#include <absl/time/clock.h>
 #include <inttypes.h>
+#include <kv/controller/v1/model.pb.h>
+#include <kv/datanode/v1/service.grpc.pb.h>
+#include <tbb/concurrent_unordered_map.h>
 #include <tbb/concurrent_vector.h>
 
 #include <array>
@@ -33,36 +37,33 @@
 #include <set>
 #include <shared_mutex>
 #include <string>
-#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "cluster/cdc_manager.h"
 #include "cluster/cluster.h"
-#include "cluster/replication.h"
-#include "cluster/slot_import.h"
-#include "cluster/slot_migrate.h"
+#include "cluster/sync_manager.h"
 #include "commands/commander.h"
-#include "common/time_util.h"
-#include "lua.hpp"
-#include "memory_profiler.h"
-#include "namespace.h"
-#include "search/index_manager.h"
-#include "search/indexer.h"
+#include "commands/scan_util.h"
+#include "kv/datanode/v1/ingest.pb.h"
+#include "kv/datanode/v1/monitorcmd.grpc.pb.h"
+#include "lock/mgl_mgr.h"
+#include "migration/migration.h"
+#include "rpc/rpc_cluster_controller.h"
+#include "script/script_manager.h"
 #include "server/redis_connection.h"
 #include "stats/log_collector.h"
 #include "stats/stats.h"
+#include "status.h"
 #include "storage/redis_metadata.h"
 #include "storage/storage.h"
 #include "task_runner.h"
 #include "tls_util.h"
 #include "worker.h"
 
-constexpr const char *REDIS_VERSION = "4.0.0";
-
 struct DBScanInfo {
-  // Last scan system clock in seconds
-  int64_t last_scan_time_secs = 0;
+  time_t last_scan_time = 0;
   KeyNumStats key_num_stats;
   bool is_scanning = false;
 };
@@ -98,18 +99,12 @@ struct ChannelSubscribeNum {
   size_t subscribe_num;
 };
 
+/*
 // CURSOR_DICT_SIZE must be 2^n where n <= 16
 constexpr const size_t CURSOR_DICT_SIZE = 1024 * 16;
 static_assert((CURSOR_DICT_SIZE & (CURSOR_DICT_SIZE - 1)) == 0, "CURSOR_DICT_SIZE must be 2^n");
 static_assert(CURSOR_DICT_SIZE <= (1 << 16), "CURSOR_DICT_SIZE must be less than or equal to 2^16");
 
-enum class CursorType : uint8_t {
-  kTypeNone = 0,  // none
-  kTypeBase = 1,  // cursor for SCAN
-  kTypeHash = 2,  // cursor for HSCAN
-  kTypeSet = 3,   // cursor for SSCAN
-  kTypeZSet = 4,  // cursor for ZSCAN
-};
 struct CursorDictElement;
 
 class NumberCursor {
@@ -130,6 +125,7 @@ struct CursorDictElement {
   NumberCursor cursor;
   std::string key_name;
 };
+*/
 
 enum SlowLog {
   kSlowLogMaxArgc = 32,
@@ -145,13 +141,6 @@ enum ClientType {
 
 enum ServerLogType { kServerLogNone, kReplIdLog };
 
-enum class AuthResult {
-  IS_USER,
-  IS_ADMIN,
-  INVALID_PASSWORD,
-  NO_REQUIRE_PASS,
-};
-
 class ServerLogData {
  public:
   // Redis::WriteBatchLogData always starts with digit ascii, we use alphabetic to
@@ -163,28 +152,79 @@ class ServerLogData {
   }
 
   ServerLogData() = default;
-  explicit ServerLogData(ServerLogType type, std::string content) : type_(type), content_(std::move(content)) {}
+  explicit ServerLogData(ServerLogType type, std::string content)
+      : type_(type), time_nanos_(absl::GetCurrentTimeNanos()), content_(std::move(content)) {}
+  explicit ServerLogData(ServerLogType type, uint64_t time_nanos, std::string content)
+      : type_(type), time_nanos_(time_nanos), content_(std::move(content)) {}
+
+  bool operator==(const ServerLogData &rhs) const {
+    return type_ == rhs.type_ && time_nanos_ == rhs.time_nanos_ && content_ == rhs.content_;
+  }
 
   ServerLogType GetType() const { return type_; }
+  uint64_t GetTimeNanos() const { return time_nanos_; }
   std::string GetContent() const { return content_; }
   std::string Encode() const;
   Status Decode(const rocksdb::Slice &blob);
 
  private:
   ServerLogType type_ = kServerLogNone;
+  uint64_t time_nanos_{0};
+  static const size_t kPrefixSize = sizeof(kReplIdTag) + sizeof(uint64_t);
   std::string content_;
 };
 
-class SlotImport;
-class SlotMigrator;
-
-class Server {
+// An extractor to extract update from raw writebatch
+class ReplIdExtractor : public rocksdb::WriteBatch::Handler {
  public:
-  explicit Server(engine::Storage *storage, Config *config);
-  ~Server();
+  rocksdb::Status PutCF(uint32_t column_family_id, const Slice &key, const Slice &value) override {
+    return rocksdb::Status::OK();
+  }
+  rocksdb::Status DeleteCF(uint32_t column_family_id, const rocksdb::Slice &key) override {
+    return rocksdb::Status::OK();
+  }
+  rocksdb::Status DeleteRangeCF(uint32_t column_family_id, const rocksdb::Slice &begin_key,
+                                const rocksdb::Slice &end_key) override {
+    return rocksdb::Status::OK();
+  }
+
+  void LogData(const rocksdb::Slice &blob) override {
+    // Currently, we always put replid log data at the end.
+    if (ServerLogData::IsServerLogData(blob.data())) {
+      ServerLogData server_log;
+      if (server_log.Decode(blob).IsOK()) {
+        if (server_log.GetType() == kReplIdLog) {
+          time_nanos_in_wal_ = server_log.GetTimeNanos();
+          replid_in_wal_ = server_log.GetContent();
+        }
+      }
+    }
+  };
+
+  uint64_t GetTimeNanos() const { return time_nanos_in_wal_; }
+
+  std::string GetReplId() { return replid_in_wal_; }
+
+ private:
+  uint64_t time_nanos_in_wal_{0};
+  std::string replid_in_wal_;
+};
+
+// legacyslots compaction info
+extern std::atomic<int16_t> global_legacyslots_compacting_count;
+extern std::atomic<uint64_t> global_legacyslots_last_compact_time;
+extern std::atomic<uint64_t> global_lagacyslots_last_compact_duration;
+
+class Server final : public kv::datanode::v1::DataNodeService::CallbackService,
+                     public std::enable_shared_from_this<Server> {
+ public:
+  explicit Server(Config *config);
+  ~Server() override;
 
   Server(const Server &) = delete;
   Server &operator=(const Server &) = delete;
+  Server(Server &&) = delete;
+  Server &operator=(Server &&) = delete;
 
   Status Start();
   void Stop();
@@ -192,22 +232,19 @@ class Server {
   bool IsStopped() const { return stop_; }
   bool IsLoading() const { return is_loading_; }
   Config *GetConfig() { return config_; }
-  static StatusOr<std::unique_ptr<redis::Commander>> LookupAndCreateCommand(const std::string &cmd_name);
+  static Status LookupAndCreateCommand(const std::string &cmd_name, std::unique_ptr<redis::Commander> *cmd);
   void AdjustOpenFilesLimit();
   void AdjustWorkerThreads();
 
-  Status AddMaster(const std::string &host, uint32_t port, bool force_reconnect);
-  Status RemoveMaster();
-  Status AddSlave(redis::Connection *conn, rocksdb::SequenceNumber next_repl_seq);
-  void DisconnectSlaves();
-  void CleanupExitedSlaves();
-  bool IsSlave() const { return !master_host_.empty(); }
+  // Worker load balancing methods
+  Worker *SelectWorkerWithLeastConnections();
+  size_t GetWorkerCount() const { return worker_threads_.size(); }
+
   void FeedMonitorConns(redis::Connection *conn, const std::vector<std::string> &tokens);
   void IncrFetchFileThread() { fetch_file_threads_num_++; }
   void DecrFetchFileThread() { fetch_file_threads_num_--; }
   int GetFetchFileThreadNum() const { return fetch_file_threads_num_; }
 
-  int PublishMessage(const std::string &channel, const std::string &msg);
   void SubscribeChannel(const std::string &channel, redis::Connection *conn);
   void UnsubscribeChannel(const std::string &channel, redis::Connection *conn);
   void GetChannelsByPattern(const std::string &pattern, std::vector<std::string> *channels);
@@ -216,11 +253,6 @@ class Server {
   void PSubscribeChannel(const std::string &pattern, redis::Connection *conn);
   void PUnsubscribeChannel(const std::string &pattern, redis::Connection *conn);
   size_t GetPubSubPatternSize() const { return pubsub_patterns_.size(); }
-  void SSubscribeChannel(const std::string &channel, redis::Connection *conn, uint16_t slot);
-  void SUnsubscribeChannel(const std::string &channel, redis::Connection *conn, uint16_t slot);
-  void GetSChannelsByPattern(const std::string &pattern, std::vector<std::string> *channels);
-  void ListSChannelSubscribeNum(const std::vector<std::string> &channels,
-                                std::vector<ChannelSubscribeNum> *channel_subscribe_nums);
 
   void BlockOnKey(const std::string &key, redis::Connection *conn);
   void UnblockOnKey(const std::string &key, redis::Connection *conn);
@@ -230,73 +262,41 @@ class Server {
   void WakeupBlockingConns(const std::string &key, size_t n_conns);
   void OnEntryAddedToStream(const std::string &ns, const std::string &key, const redis::StreamEntryID &entry_id);
 
-  // WAIT command infrastructure
-  void BlockOnWait(redis::Connection *conn, rocksdb::SequenceNumber target_seq, uint64_t num_replicas);
-  void WakeupWaitConnections(rocksdb::SequenceNumber seq);
-  void CleanupWaitConnection(redis::Connection *conn);
-  void WakeupWaitConnection(redis::Connection *conn, rocksdb::SequenceNumber seq);
-
-  // Helper methods for WAIT command
-  size_t GetReplicasReachedSequence(rocksdb::SequenceNumber target_seq);
-  // Return the largest wait_context.target_seq that can wakeup given the seq.
-  // If no wait_context can wakeup, return 0.
-  rocksdb::SequenceNumber LargestTargetSeqToWakeup(rocksdb::SequenceNumber seq);
-
-  size_t GetReplicaCount() {
-    std::shared_lock<std::shared_mutex> guard(slave_threads_mu_);
-    return slave_threads_.size();
-  }
-
   std::string GetLastRandomKeyCursor();
   void SetLastRandomKeyCursor(const std::string &cursor);
 
   static int64_t GetCachedUnixTime();
   int64_t GetLastBgsaveTime();
-  std::string GetRoleInfo();
-
-  struct InfoEntry {
-    std::string name;
-    std::string val;
-
-    InfoEntry(std::string name, std::string val) : name(std::move(name)), val(std::move(val)) {}
-    InfoEntry(std::string name, std::string_view val) : name(std::move(name)), val(val.begin(), val.end()) {}
-    InfoEntry(std::string name, const char *val) : name(std::move(name)), val(val) {}
-    template <typename T, std::enable_if_t<std::is_integral_v<T> || std::is_floating_point_v<T>, int> = 0>
-    InfoEntry(std::string name, T v) : name(std::move(name)), val(std::to_string(v)) {}
-  };
-  using InfoEntries = std::vector<InfoEntry>;
-
-  InfoEntries GetStatsInfo();
-  InfoEntries GetServerInfo();
-  InfoEntries GetMemoryInfo();
-  InfoEntries GetRocksDBInfo();
-  InfoEntries GetClientsInfo();
-  InfoEntries GetReplicationInfo();
-  InfoEntries GetCommandsStatsInfo();
-  InfoEntries GetClusterInfo();
-  InfoEntries GetPersistenceInfo();
-  InfoEntries GetCpuInfo();
-  InfoEntries GetKeyspaceInfo(const std::string &ns);
-
-  std::string GetInfo(const std::string &ns, const std::vector<std::string> &sections);
+  void GetStatsInfo(std::string *info);
+  void GetNetInfo(std::string *info);
+  void GetServerInfo(std::string *info);
+  void GetMemoryInfo(std::string *info);
+  static void GetCounterMetric(std::string *info);
+  static void GetHistogramMetric(std::string *info);
+  void GetClientsInfo(std::string *info);
+  void GetCommandsStatsInfo(std::string *info);
+  void GetClusterInfo(std::string *info);
+  void GetInfo(const std::string &ns, const std::string &section, std::string *info);
+  void GetRocksDBInfo(std::string *info);
+  void GetLegacyslotsCompactInfo(std::string *info);
+  void GetDBAndCFList(std::string *info);
+  void GetDBPropertyInfo(const std::string &query_params, std::string *info);
+  void HandleCFOptionCommand(const std::string &query_params, std::string *result);
+  static void GetMetricInfo(const std::string &ns, const std::string &section, std::string *reply);
   std::string GetRocksDBStatsJson() const;
-  ReplState GetReplicationState();
+  std::string GetRocksDBStats() const;
+  void GetCtrlClientInfo(std::string *info) const;
+  std::string IngestJobIsRunning();
 
-  bool PrepareRestoreDB();
   void WaitNoMigrateProcessing();
-  Status AsyncCompactDB(const std::string &begin_key = "", const std::string &end_key = "");
-  Status AsyncBgSaveDB();
-  Status AsyncPurgeOldBackups(uint32_t num_backups_to_keep, uint32_t backup_max_keep_hours);
-  Status AsyncScanDBSize(const std::string &ns);
   void GetLatestKeyNumStats(const std::string &ns, KeyNumStats *stats);
-  int64_t GetLastScanTime(const std::string &ns) const;
-  StatusOr<std::vector<rocksdb::BatchResult>> PollUpdates(uint64_t next_sequence, int64_t count, bool is_strict) const;
+  time_t GetLastScanTime(const std::string &ns);
 
   std::string GenerateCursorFromKeyName(const std::string &key_name, CursorType cursor_type, const char *prefix = "");
   std::string GetKeyNameFromCursor(const std::string &cursor, CursorType cursor_type);
 
-  int DecrClientNum();
-  int IncrClientNum();
+  int DecrClientNum(const std::thread::id &tid);
+  int IncrClientNum(const std::thread::id &tid);
   int IncrMonitorClientNum();
   int DecrMonitorClientNum();
   int IncrBlockedClientNum();
@@ -306,75 +306,141 @@ class Server {
   void KillClient(int64_t *killed, const std::string &addr, uint64_t id, uint64_t type, bool skipme,
                   redis::Connection *conn);
 
-  Status ScriptExists(const std::string &sha) const;
-  Status ScriptGet(const std::string &sha, std::string *body) const;
-  Status ScriptSet(const std::string &sha, const std::string &body) const;
-  void ScriptReset();
-  Status ScriptFlush();
-
-  Status FunctionGetCode(const std::string &lib, std::string *code) const;
-  Status FunctionGetLib(const std::string &func, std::string *lib) const;
-  Status FunctionSetCode(const std::string &lib, const std::string &code) const;
-  Status FunctionSetLib(const std::string &func, const std::string &lib) const;
-
-  Status Propagate(const std::string &channel, const std::vector<std::string> &tokens) const;
-  Status ExecPropagatedCommand(const std::vector<std::string> &tokens);
-
   LogCollector<PerfEntry> *GetPerfLog() { return &perf_log_; }
   LogCollector<SlowEntry> *GetSlowLog() { return &slow_log_; }
-  void SlowlogPushEntryIfNeeded(const std::vector<std::string> *args, uint64_t duration, const redis::Connection *conn);
+  void SlowlogPushEntryIfNeeded(const std::vector<std::string> *args, uint64_t duration, const redis::Connection *conn,
+                                bool is_profiling, std::optional<std::pair<std::string, std::string>> &perf_io_context,
+                                int64_t prepare_duration = -1, int64_t command_queue_latency_on_connection = -1,
+                                int64_t estimated_subkey_count = -1);
 
-  std::shared_lock<std::shared_mutex> WorkConcurrencyGuard();
-  std::unique_lock<std::shared_mutex> WorkExclusivityGuard();
+  // concurrent_unordered_map guarantee concurrent update, insert, iterate while erasing is not concurrent safe.
+  // so never use erase in thread safe scenario.
+  // see https://learn.microsoft.com/en-us/cpp/parallel/concrt/reference/concurrent-unordered-map-class?view=msvc-170
+  tbb::concurrent_unordered_map<std::thread::id, uint32_t> number_of_worker_connections_;
+  std::shared_ptr<engine::StorageManager> storage_mgr;
+  std::unique_ptr<lua::ScriptManager> script_mgr;
+  std::unique_ptr<redis::CursorLRUcache> scan_lru_cache;
+  std::unique_ptr<redis::CursorLRUcache> xscan_lru_cache;
+  std::unique_ptr<redis::Cluster> cluster;
+  static inline std::atomic<int64_t> unix_time = 0;
 
-  Stats stats;
-  engine::Storage *storage;
-  MemoryProfiler memory_profiler;
-  std::unique_ptr<Cluster> cluster;
-  static inline std::atomic<int64_t> unix_time_secs = 0;
-  std::unique_ptr<SlotMigrator> slot_migrator;
-  std::unique_ptr<SlotImport> slot_import;
+  std::unique_ptr<ControllerApiClient> ctrl_rpc_client;
+  std::unique_ptr<redis::SyncManager> sync_manager;
+  std::unique_ptr<redis::Migration> migration;
+  std::unique_ptr<util::TimeoutManager> timeout_mgr;
+
+  std::unique_ptr<redis::CDCManager> cdc_manager;
 
   void UpdateWatchedKeysFromArgs(const std::vector<std::string> &args, const redis::CommandAttributes &attr);
   void UpdateWatchedKeysManually(const std::vector<std::string> &keys);
   void WatchKey(redis::Connection *conn, const std::vector<std::string> &keys);
   static bool IsWatchedKeysModified(redis::Connection *conn);
   void ResetWatchedKeys(redis::Connection *conn);
-  std::list<std::pair<std::string, uint32_t>> GetSlaveHostAndPort();
-  Namespace *GetNamespace() { return &namespace_; }
 
-  AuthResult AuthenticateUser(const std::string &user_password, std::string *ns);
+  redis::mgl::MGLockMgr *GetMGLockMgr() { return mgl_mgr_.get(); }
 
+  std::string GetClusterId() const { return cluster->ClusterId(); };
+
+  std::shared_ptr<redis::SlotRange> GetSlotRangeByIndex(const kv::controller::v1::SlotRangeIndex &index) const {
+    return cluster->GetSlotRangeByIndex(index);
+  };
+
+  bool CheckClusterId(const std::string &expect) const { return GetClusterId() == expect; };
+
+  bool CheckDataNodeId(const std::string &expect) const { return cluster->DatanodeId() == expect; };
+
+  // grpc service interface
+  grpc::ServerUnaryReactor *GetSyncPoint(grpc::CallbackServerContext *, const kv::datanode::v1::GetSyncPointRequest *,
+                                         kv::datanode::v1::GetSyncPointResponse *) override;
+  grpc::ServerWriteReactor<kv::datanode::v1::PullSyncDataResponse> *PullSyncData(
+      grpc::CallbackServerContext *, const kv::datanode::v1::PullSyncDataRequest *) override;
+  grpc::ServerReadReactor<kv::datanode::v1::PushSyncDataRequest> *PushSyncData(
+      grpc::CallbackServerContext *, kv::datanode::v1::PushSyncDataResponse *) override;
+  grpc::ServerUnaryReactor *ReportSyncError(grpc::CallbackServerContext *,
+                                            const kv::datanode::v1::ReportSyncErrorRequest *,
+                                            kv::datanode::v1::ReportSyncErrorResponse *) override;
+  grpc::ServerUnaryReactor *GetSyncConfig(grpc::CallbackServerContext *,
+                                          const ::kv::datanode::v1::GetSyncConfigRequest *,
+                                          kv::datanode::v1::GetSyncConfigResponse *) override;
+  grpc::ServerUnaryReactor *UpdateSyncConfig(grpc::CallbackServerContext *,
+                                             const kv::datanode::v1::UpdateSyncConfigRequest *,
+                                             kv::datanode::v1::UpdateSyncConfigResponse *) override;
+  grpc::ServerBidiReactor<kv::datanode::v1::SyncDataRequest, kv::datanode::v1::SyncDataResponse> *SyncData(
+      grpc::CallbackServerContext *) override;
+  grpc::ServerUnaryReactor *Failover(grpc::CallbackServerContext *, const kv::datanode::v1::FailoverRequest *,
+                                     kv::datanode::v1::FailoverResponse *) override;
+  grpc::ServerUnaryReactor *Migrate(grpc::CallbackServerContext *, const kv::datanode::v1::MigrateRequest *,
+                                    kv::datanode::v1::MigrateResponse *) override;
+
+  // standalone mode, data recovery
+  grpc::ServerUnaryReactor *GetLatestPoint(grpc::CallbackServerContext *,
+                                           const kv::datanode::v1::GetLatestPointRequest *,
+                                           kv::datanode::v1::GetLatestPointResponse *) override;
+  grpc::ServerUnaryReactor *GetDataWithCmd(grpc::CallbackServerContext *,
+                                           const kv::datanode::v1::GetDataWithCmdRequest *,
+                                           kv::datanode::v1::GetDataWithCmdResponse *) override;
+  grpc::ServerUnaryReactor *Ingest(grpc::CallbackServerContext *, const kv::datanode::v1::IngestRequest *,
+                                   kv::datanode::v1::IngestResponse *) override;
+  grpc::ServerUnaryReactor *GetIngestInfo(grpc::CallbackServerContext *, const kv::datanode::v1::GetIngestInfoRequest *,
+                                          kv::datanode::v1::GetIngestInfoResponse *) override;
+
+  grpc::ServerUnaryReactor *StopDatanodeDts(grpc::CallbackServerContext *,
+                                            const kv::datanode::v1::StopDatanodeDtsRequest *,
+                                            kv::datanode::v1::StopDatanodeDtsResponse *) override;
+
+  grpc::ServerUnaryReactor *StartDatanodeDts(grpc::CallbackServerContext *,
+                                             const kv::datanode::v1::StartDatanodeDtsRequest *,
+                                             kv::datanode::v1::StartDatanodeDtsResponse *) override;
+  // cdc service
+  grpc::ServerUnaryReactor *CDCGetLatestPoint(grpc::CallbackServerContext *,
+                                              const kv::datanode::v1::CDCGetLatestPointRequest *,
+                                              kv::datanode::v1::CDCGetLatestPointResponse *) override;
+  grpc::ServerWriteReactor<kv::datanode::v1::CDCGetEventsResponse> *CDCGetEvents(
+      grpc::CallbackServerContext *, const kv::datanode::v1::CDCGetEventsRequest *) override;
+  grpc::ServerUnaryReactor *CDCGetRestartPoint(grpc::CallbackServerContext *,
+                                               const kv::datanode::v1::CDCGetRestartPointRequest *,
+                                               kv::datanode::v1::CDCGetRestartPointResponse *) override;
+  grpc::ServerUnaryReactor *CDCGetOldestPoint(grpc::CallbackServerContext *,
+                                              const kv::datanode::v1::CDCGetOldestPointRequest *,
+                                              kv::datanode::v1::CDCGetOldestPointResponse *) override;
+
+  grpc::ServerUnaryReactor *MonitorCmd(grpc::CallbackServerContext *, const kv::datanode::v1::MonitorCmdRequest *,
+                                       kv::datanode::v1::MonitorCmdResponse *) override;
 #ifdef ENABLE_OPENSSL
   UniqueSSLContext ssl_ctx;
 #endif
 
-  // search
-  redis::GlobalIndexer indexer;
-  redis::IndexManager index_mgr;
+  Status SetDBOption(const std::string &key, const std::string &value);
+  Status SetDBOptionForAllColumnFamilies(const std::string &key, const std::string &value);
+  Status SetDBOptionForColumnFamily(const std::string &db_name, const std::string &cf_name, const std::string &key,
+                                    const std::string &value);
+  Status SubCompactJob(const std::string &begin_key, std::string &end_key, const std::string &name, bool is_compact,
+                       bool with_filter = true);
+  Status SubCompactLegacyJob() const;
+  void GetAllSlotRangeName(std::string *output) const;
+  std::chrono::nanoseconds GetWorkersBlockedDuration() const;
 
  private:
+  friend class MockServer;
+
   void cron();
   void recordInstantaneousMetrics();
   static void updateCachedTime();
+  Status autoResizeBlockAndSST();
   void updateWatchedKeysFromRange(const std::vector<std::string> &args, const redis::CommandKeyRange &range);
   void updateAllWatchedKeys();
   void increaseWorkerThreads(size_t delta);
   void decreaseWorkerThreads(size_t delta);
   void cleanupExitedWorkerThreads(bool force);
-  // Helper function to clean up wait contexts for a given connection
-  // It would not hold the wait_contexts_mu_ and the caller should hold it.
-  void cleanupWaitConnection(redis::Connection *conn);
 
   std::atomic<bool> stop_ = false;
   std::atomic<bool> is_loading_ = false;
-  int64_t start_time_secs_;
-  std::mutex slaveof_mu_;
-  std::string master_host_;
-  uint32_t master_port_ = 0;
+  int64_t start_time_;
   Config *config_ = nullptr;
   std::string last_random_key_cursor_;
   std::mutex last_random_key_cursor_mu_;
+
+  redis::Connection *curr_connection_ = nullptr;
 
   // client counters
   std::atomic<uint64_t> client_id_{1};
@@ -383,20 +449,7 @@ class Server {
   std::atomic<uint64_t> total_clients_{0};
 
   // slave
-  std::shared_mutex slave_threads_mu_;
-  std::list<std::unique_ptr<FeedSlaveThread>> slave_threads_;
   std::atomic<int> fetch_file_threads_num_ = 0;
-
-  // namespace
-  Namespace namespace_;
-
-  // Some jobs to operate DB should be unique
-  std::mutex db_job_mu_;
-  bool db_compacting_ = false;
-  bool is_bgsave_in_progress_ = false;
-  int64_t last_bgsave_timestamp_secs_ = -1;
-  std::string last_bgsave_status_ = "ok";
-  int64_t last_bgsave_duration_secs_ = -1;
 
   std::map<std::string, DBScanInfo> db_scan_infos_;
 
@@ -406,8 +459,6 @@ class Server {
   std::map<std::string, std::list<ConnContext>> pubsub_channels_;
   std::map<std::string, std::list<ConnContext>> pubsub_patterns_;
   std::mutex pubsub_channels_mu_;
-  std::vector<std::map<std::string, std::list<ConnContext>>> pubsub_shard_channels_;
-  std::mutex pubsub_shard_channels_mu_;
   std::map<std::string, std::list<ConnContext>> blocking_keys_;
   std::mutex blocking_keys_mu_;
 
@@ -416,25 +467,10 @@ class Server {
   std::mutex blocked_stream_consumers_mu_;
   std::map<std::string, std::set<std::shared_ptr<StreamConsumer>>> blocked_stream_consumers_;
 
-  // WAIT command blocking infrastructure
-  struct WaitContext {
-    redis::Connection *conn;
-    rocksdb::SequenceNumber target_seq;
-    uint64_t num_replicas;
-
-    WaitContext(redis::Connection *c, rocksdb::SequenceNumber seq, uint64_t replicas)
-        : conn(c), target_seq(seq), num_replicas(replicas) {}
-  };
-  std::multimap<rocksdb::SequenceNumber, WaitContext> wait_contexts_;
-  std::shared_mutex wait_contexts_mu_;
-
   // threads
-  std::shared_mutex works_concurrency_rw_lock_;
   std::thread cron_thread_;
-  std::thread compaction_checker_thread_;
   TaskRunner task_runner_;
   std::vector<std::unique_ptr<WorkerThread>> worker_threads_;
-  std::unique_ptr<ReplicationThread> replication_thread_;
   tbb::concurrent_queue<std::unique_ptr<WorkerThread>> recycle_worker_threads_;
 
   // memory
@@ -446,7 +482,11 @@ class Server {
   std::shared_mutex watched_key_mutex_;
 
   // SCAN ring buffer
-  std::atomic<uint16_t> cursor_counter_ = {0};
-  using CursorDictType = std::array<CursorDictElement, CURSOR_DICT_SIZE>;
-  std::unique_ptr<CursorDictType> cursor_dict_;
+  // std::atomic<uint16_t> cursor_counter_ = {0};
+  // using CursorDictType = std::array<CursorDictElement, CURSOR_DICT_SIZE>;
+  // std::unique_ptr<CursorDictType> cursor_dict_;
+
+  std::unique_ptr<redis::mgl::MGLockMgr> mgl_mgr_;
+
+  std::unique_ptr<grpc::Server> grpc_server_;
 };

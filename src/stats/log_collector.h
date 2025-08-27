@@ -23,6 +23,7 @@
 #include <sys/types.h>
 #include <time.h>
 
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -31,19 +32,21 @@
 #include <string>
 #include <vector>
 
-#include "spdlog/common.h"
-
 class SlowEntry {
  public:
   uint64_t id;
   time_t time;
   uint64_t duration;
+  int64_t prepare_duration;
+  int64_t command_queue_latency_on_connection;
+  int64_t estimated_subkey_count;
   std::vector<std::string> args;
   std::string client_name;
   std::string ip;
   uint32_t port;
+
   std::string ToRedisString() const;
-  void DumpToLogFile(spdlog::level::level_enum) const;
+  friend std::ostream &operator<<(std::ostream &, const SlowEntry &);
 };
 
 class PerfEntry {
@@ -51,12 +54,13 @@ class PerfEntry {
   uint64_t id;
   time_t time;
   uint64_t duration;
+  int64_t prepare_duration;
+  int64_t command_queue_latency_on_connection;
   std::string cmd_name;
   std::string perf_context;
   std::string iostats_context;
 
   std::string ToRedisString() const;
-  void DumpToLogFile(spdlog::level::level_enum) const {};
 };
 
 template <class T>
@@ -68,15 +72,14 @@ class LogCollector {
   ~LogCollector();
   ssize_t Size();
   void Reset();
-  void SetMaxEntries(int64_t max_entries);
+  void SetMaxEntries(uint64_t max_entries);
+  uint64_t GetMaxEntries() { return max_entries_.load(); }
   void PushEntry(std::unique_ptr<T> &&entry);
   std::string GetLatestEntries(int64_t cnt);
-  void SetDumpToLogfileLevel(spdlog::level::level_enum level);
 
  private:
   std::mutex mu_;
   uint64_t id_ = 0;
-  int64_t max_entries_ = 128;
+  std::atomic<uint64_t> max_entries_ = 0;
   std::deque<std::unique_ptr<T>> entries_;
-  spdlog::level::level_enum dump_to_logfile_level_ = spdlog::level::off;
 };

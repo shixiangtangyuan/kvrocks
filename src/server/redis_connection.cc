@@ -17,26 +17,35 @@
  * under the License.
  *
  */
-
+#include <event2/buffer.h>
+#include <glog/logging.h>
 #include <rocksdb/iostats_context.h>
 #include <rocksdb/perf_context.h>
 
+#include <chrono>
 #include <mutex>
+#include <ratio>
 #include <shared_mutex>
+#include <string>
 
+#include "absl/cleanup/cleanup.h"
 #include "commands/commander.h"
-#include "commands/error_constants.h"
+#include "commands/scan_util.h"
 #include "fmt/format.h"
-#include "logging.h"
-#include "nonstd/span.hpp"
-#include "search/indexer.h"
-#include "server/redis_reply.h"
+#include "lock/lock.h"
+#include "lock/lock_defines.h"
+#include "stats/stats.h"
+#include "status.h"
 #include "string_util.h"
 #ifdef ENABLE_OPENSSL
 #include <event2/bufferevent_ssl.h>
 #endif
+#include <event2/bufferevent_struct.h>
+#include <event2/event.h>
 
+#include "cluster/cluster.h"
 #include "commands/blocking_commander.h"
+#include "commands/cmd_scan.h"
 #include "redis_connection.h"
 #include "scope_exit.h"
 #include "server.h"
@@ -80,75 +89,146 @@ void Connection::Close() {
 
 void Connection::Detach() { owner_->DetachConnection(this); }
 
-void Connection::OnRead([[maybe_unused]] struct bufferevent *bev) {
+void Connection::OnRead(struct bufferevent *bev) {
+  if (hasBufferExceedLimit(0)) {
+    if (IsFlagEnabled(kCloseAsync)) {
+      Close();
+    }
+    return;
+  }
+  if (is_blocked_) return;
+
   is_running_ = true;
-  MakeScopeExit([this] { is_running_ = false; });
+  auto exit = MakeScopeExit([this] {
+    thread_local_metric_array.Record(MetricType::CLIENT_OUT_BUFFER_SIZE, {}, evbuffer_get_length(Output()));
+    is_running_ = false;
+  });
 
   SetLastInteraction();
-  auto s = req_.Tokenize(Input());
+  start_processing_time_ = std::chrono::steady_clock::now();
+
+  auto s = req_.Tokenize(Input(), GetCommandsPtr());
   if (!s.IsOK()) {
     EnableFlag(redis::Connection::kCloseAfterReply);
-    Reply(redis::Error(s));
-    info("[connection] Failed to tokenize the request. Error: {}", s.Msg());
+    Reply(redis::Error("ERR " + s.Msg()));
+    LOG(INFO) << "[connection] Failed to tokenize the request. Error: " << s.Msg();
+    if (IsFlagEnabled(kCloseAsync)) {
+      Close();
+    }
     return;
   }
 
-  ExecuteCommands(req_.GetCommands());
+  ExecuteCommands();
   if (IsFlagEnabled(kCloseAsync)) {
     Close();
   }
 }
 
-void Connection::OnWrite([[maybe_unused]] bufferevent *bev) {
+void Connection::OnWrite(bufferevent *bev) {
+  int current_priority = event_get_priority(&bev->ev_write);
+  int target_priority = owner_->srv->GetConfig()->bufferevent_write_priority;
+
+  if (current_priority != target_priority) {
+    if (event_priority_set(&bev->ev_write, target_priority) == -1) {
+      LOG(WARNING) << "[connection] Failed to set write priority for fd=" << bufferevent_getfd(bev)
+                   << ", current=" << current_priority << ", target=" << target_priority;
+    } else {
+      LOG(INFO) << "[connection] Set write priority for fd=" << bufferevent_getfd(bev) << ", from=" << current_priority
+                << " to=" << target_priority;
+    }
+  }
+
   if (IsFlagEnabled(kCloseAfterReply) || IsFlagEnabled(kCloseAsync)) {
     Close();
+    return;
+  }
+
+  if (IsFlagEnabled(kReadDisabled)) {
+    if (auto ret = bufferevent_enable(bev, EV_READ); ret != 0) {
+      LOG(WARNING) << "[connection] Enable read event failed, client:" << GetAddr() << ", code:" << ret;
+      Close();
+      return;
+    }
+    DisableFlag(kReadDisabled);
+    bufferevent_trigger(bev, EV_READ, 0);
   }
 }
 
 void Connection::OnEvent(bufferevent *bev, int16_t events) {
   if (events & BEV_EVENT_ERROR) {
+    LOG(ERROR) << "[connection] Going to remove the client: " << GetAddr()
+               << ", while encounter error: " << evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR())
 #ifdef ENABLE_OPENSSL
-    error("[connection] Removing client: {}, error: {}, SSL Error: {}", GetAddr(),
-          evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR()),
-          fmt::streamed(SSLError(bufferevent_get_openssl_error(bev))));  // NOLINT
-#else
-    error("[connection] Removing client: {}, error: {}", GetAddr(),
-          evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR()));
+               << ", SSL Error: " << SSLError(bufferevent_get_openssl_error(bev))  // NOLINT
 #endif
+        ;  // NOLINT
     Close();
     return;
   }
 
   if (events & BEV_EVENT_EOF) {
-    debug("[connection] Going to remove the client: {}, while closed by client", GetAddr());
+    LOG(INFO) << "[connection] Going to remove the client: " << GetAddr() << ", while closed by client";
     Close();
     return;
   }
 
   if (events & BEV_EVENT_TIMEOUT) {
-    debug("[connection] The client: {} reached timeout", GetAddr());
+    LOG(INFO) << "[connection] The client: " << GetAddr() << "] reached timeout";
     bufferevent_enable(bev, EV_READ | EV_WRITE);
   }
 }
 
-void Connection::Reply(const std::string &msg) {
-  if (reply_mode_ == ReplyMode::SKIP) {
-    reply_mode_ = ReplyMode::ON;
-    return;
+bool Connection::hasBufferExceedLimit(size_t msg_size) {
+  if (size_t limit = srv_->GetConfig()->client_buffer_limit_mb * MiB; limit > 0) {
+    size_t input_size = evbuffer_get_length(Input());
+    size_t output_size = evbuffer_get_length(Output());
+    if (input_size + output_size + msg_size > limit) {
+      LOG(WARNING) << "[connection] Client buffer exceed limit, client:" << GetAddr() << ", input:" << input_size
+                   << ", output:" << output_size << ", msg:" << msg_size << ", limit:" << limit;
+      static const std::string kBufferExceedLimitErr = redis::Error("ERR connection buffer exceed limit");
+      GlobalStatsInstance().IncrClientBufferExceedLimitCount();
+      if (disableReadEvent()) {
+        // close after send kBufferExceedLimitErr reply
+        if (reply(kBufferExceedLimitErr)) EnableFlag(kCloseAfterReply);
+      } else {
+        // close ASAP when disable read event failed
+        EnableFlag(kCloseAsync);
+      }
+      return true;
+    }
+    if ((output_size + msg_size) > limit / 2) {
+      // try disable read event when output buffer congested
+      GlobalStatsInstance().IncrClientBufferCongestedCount();
+      disableReadEvent();
+    }
   }
-  if (reply_mode_ == ReplyMode::OFF) {
-    return;
-  }
-
-  owner_->srv->stats.IncrOutboundBytes(msg.size());
-  if (in_exec_) {
-    queued_replies_.push_back(msg);
-  } else {
-    redis::Reply(bufferevent_get_output(bev_), msg);
-  }
+  return false;
 }
 
-const std::vector<std::string> &Connection::GetQueuedReplies() const { return queued_replies_; }
+bool Connection::disableReadEvent() {
+  if (IsFlagEnabled(kReadDisabled)) return true;
+
+  if (auto ret = bufferevent_disable(bev_, EV_READ); ret != 0) {
+    LOG(WARNING) << "[connection] Disable read event failed, client:" << GetAddr() << ", code:" << ret;
+    return false;
+  }
+  EnableFlag(kReadDisabled);
+  return true;
+}
+
+void Connection::Reply(const std::string &msg) {
+  if (!hasBufferExceedLimit(msg.size())) reply(msg);
+}
+
+bool Connection::reply(const std::string &msg) {
+  if (auto ret = redis::Reply(Output(), msg); ret != 0) {
+    LOG(WARNING) << "[connection] Add resp to output buffer failed, client:" << GetAddr() << ", code:" << ret;
+    EnableFlag(kCloseAsync);
+    return false;
+  }
+  GlobalStatsInstance().IncrOutbondBytes(msg.size());
+  return true;
+}
 
 void Connection::SendFile(int fd) {
   // NOTE: we don't need to close the fd, the libevent will do that
@@ -163,8 +243,6 @@ void Connection::SetAddr(std::string ip, uint32_t port) {
 }
 
 uint64_t Connection::GetAge() const { return static_cast<uint64_t>(util::GetTimeStamp() - create_time_); }
-
-void Connection::SetLastInteraction() { last_interaction_ = util::GetTimeStamp(); }
 
 uint64_t Connection::GetIdleTime() const { return static_cast<uint64_t>(util::GetTimeStamp() - last_interaction_); }
 
@@ -188,7 +266,6 @@ std::string Connection::GetFlags() const {
   if (IsFlagEnabled(kSlave)) flags.append("S");
   if (IsFlagEnabled(kCloseAfterReply)) flags.append("c");
   if (IsFlagEnabled(kMonitor)) flags.append("M");
-  if (IsFlagEnabled(kAsking)) flags.append("A");
   if (!subscribe_channels_.empty() || !subscribe_patterns_.empty()) flags.append("P");
   if (flags.empty()) flags = "N";
   return flags;
@@ -282,45 +359,6 @@ void Connection::PUnsubscribeAll(const UnsubscribeCallback &reply) {
 
 int Connection::PSubscriptionsCount() { return static_cast<int>(subscribe_patterns_.size()); }
 
-void Connection::SSubscribeChannel(const std::string &channel, uint16_t slot) {
-  for (const auto &chan : subscribe_shard_channels_) {
-    if (channel == chan) return;
-  }
-
-  subscribe_shard_channels_.emplace_back(channel);
-  owner_->srv->SSubscribeChannel(channel, this, slot);
-}
-
-void Connection::SUnsubscribeChannel(const std::string &channel, uint16_t slot) {
-  for (auto iter = subscribe_shard_channels_.begin(); iter != subscribe_shard_channels_.end(); iter++) {
-    if (*iter == channel) {
-      subscribe_shard_channels_.erase(iter);
-      owner_->srv->SUnsubscribeChannel(channel, this, slot);
-      return;
-    }
-  }
-}
-
-void Connection::SUnsubscribeAll(const UnsubscribeCallback &reply) {
-  if (subscribe_shard_channels_.empty()) {
-    if (reply) reply("", 0);
-    return;
-  }
-
-  int removed = 0;
-  for (const auto &chan : subscribe_shard_channels_) {
-    owner_->srv->SUnsubscribeChannel(chan, this,
-                                     owner_->srv->GetConfig()->cluster_enabled ? GetSlotIdFromKey(chan) : 0);
-    removed++;
-    if (reply) {
-      reply(chan, static_cast<int>(subscribe_shard_channels_.size() - removed));
-    }
-  }
-  subscribe_shard_channels_.clear();
-}
-
-int Connection::SSubscriptionsCount() { return static_cast<int>(subscribe_shard_channels_.size()); }
-
 bool Connection::IsProfilingEnabled(const std::string &cmd) {
   auto config = srv_->GetConfig();
   if (config->profiling_sample_ratio == 0) return false;
@@ -340,261 +378,393 @@ bool Connection::IsProfilingEnabled(const std::string &cmd) {
   return false;
 }
 
-void Connection::RecordProfilingSampleIfNeed(const std::string &cmd, uint64_t duration) {
-  int threshold = srv_->GetConfig()->profiling_sample_record_threshold_ms;
-  if (threshold > 0 && static_cast<int>(duration / 1000) < threshold) {
+void Connection::RecordProfilingSampleIfNeed(const std::string &cmd, uint64_t duration,
+                                             std::optional<std::pair<std::string, std::string>> &&perf_io_context,
+                                             int64_t prepare_duration, int64_t command_queue_latency_on_connection) {
+  int64_t threshold = srv_->GetConfig()->profiling_sample_record_threshold_us;
+  if (threshold < 0 || static_cast<int64_t>(duration) < threshold || srv_->GetPerfLog()->GetMaxEntries() <= 0) {
     rocksdb::SetPerfLevel(rocksdb::PerfLevel::kDisable);
     return;
   }
 
-  std::string perf_context = rocksdb::get_perf_context()->ToString(true);
-  std::string iostats_context = rocksdb::get_iostats_context()->ToString(true);
+  if (!perf_io_context.has_value()) {
+    perf_io_context =
+        std::make_pair(rocksdb::get_perf_context()->ToString(true), rocksdb::get_iostats_context()->ToString(true));
+  }
   rocksdb::SetPerfLevel(rocksdb::PerfLevel::kDisable);
-  if (perf_context.empty()) return;  // request without db operation
+  // request without db operation
+  if (perf_io_context->first.empty()) return;
 
   auto entry = std::make_unique<PerfEntry>();
   entry->cmd_name = cmd;
   entry->duration = duration;
-  entry->iostats_context = std::move(iostats_context);
-  entry->perf_context = std::move(perf_context);
+  entry->prepare_duration = prepare_duration;
+  entry->command_queue_latency_on_connection = command_queue_latency_on_connection;
+  entry->perf_context = std::move(perf_io_context->first);
+  entry->iostats_context = std::move(perf_io_context->second);
   srv_->GetPerfLog()->PushEntry(std::move(entry));
 }
 
-Status Connection::ExecuteCommand(engine::Context &ctx, const std::string &cmd_name,
-                                  const std::vector<std::string> &cmd_tokens, Commander *current_cmd,
-                                  std::string *reply) {
-  srv_->stats.IncrCalls(cmd_name);
+Status Connection::CheckKeysInSameSlot(const CommandAttributes *attr, const CommandTokens &cmd_token) {
+  // get key indexes
+  std::vector<int> key_indexes;
+  auto s = CommandTable::GetKeysFromCommand(attr, cmd_token, &key_indexes);
+  if (!s.IsOK()) return s;
 
-  auto start = std::chrono::high_resolution_clock::now();
-  bool is_profiling = IsProfilingEnabled(cmd_name);
-  auto s = current_cmd->Execute(ctx, srv_, this, reply);
-  auto end = std::chrono::high_resolution_clock::now();
-  uint64_t duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-  if (is_profiling) RecordProfilingSampleIfNeed(cmd_name, duration);
+  // check keys in same slot
+  int16_t slot = -1;
+  for (auto idx : key_indexes) {
+    if (idx >= static_cast<int>(cmd_token.size())) break;
+    auto cur_slot = GetSlotIdFromKey(cmd_token[idx]);
+    if (slot == -1) slot = static_cast<int16_t>(cur_slot);
+    if (cur_slot != slot) {
+      return Status{Status::NotOK, "CROSSSLOT Attempted to access keys that don't hash to the same slot"};
+    }
+  }
 
-  srv_->SlowlogPushEntryIfNeeded(&cmd_tokens, duration, this);
-  srv_->stats.IncrLatency(static_cast<uint64_t>(duration), cmd_name);
-  return s;
+  return Status::OK();
 }
 
-static bool IsCmdForIndexing(uint64_t cmd_flags, CommandCategory cmd_cat) {
-  return (cmd_flags & redis::kCmdWrite) &&
-         (cmd_cat == CommandCategory::Hash || cmd_cat == CommandCategory::JSON || cmd_cat == CommandCategory::Key ||
-          cmd_cat == CommandCategory::Script || cmd_cat == CommandCategory::Function);
+Status Connection::HandleCmdScript(Context *ctx, std::vector<std::unique_ptr<SlotRangeLock>> *sr_locks) {
+  // lock all slotrange with LOCK_X
+  auto s = lockAllSlotRanges(ctx, mgl::LockMode::LOCK_X, sr_locks);
+  if (!s.IsOK()) {
+    return s;
+  }
+
+  // check script executable
+  s = srv_->cluster->CanScriptExecbyMyself();
+  if (!s.IsOK()) {
+    return s;
+  }
+  return Status::OK();
 }
 
-static bool IsCmdAllowedInStaleData(const std::string &cmd_name) {
-  return cmd_name == "info" || cmd_name == "slaveof" || cmd_name == "config";
+StatusOr<std::shared_ptr<engine::Storage>> Connection::HandleCmdNodeScan(
+    uint64_t cmd_flags, const std::unique_ptr<Commander> &cmd, Context *ctx,
+    std::vector<std::unique_ptr<SlotRangeLock>> *sr_locks) {
+  // get slotrange name of starting slot
+  auto slot = static_cast<CommandNodeScan *>(cmd.get())->GetStartSlotId();
+  auto slotrange_name = srv_->cluster->GetSlotRangeNameBySlotId(slot);
+
+  // lock slotrange
+  auto res = SlotRangeLock::AcquireSlotRangeLock(slotrange_name, mgl::LockMode::LOCK_IS, ctx, srv_->GetMGLockMgr());
+  if (!res.IsOK()) {
+    return Status{res.Is<Status::LockTimeOut>() ? Status::LockTimeOutSlotRange : Status::NotOK, res.Msg()};
+  }
+  sr_locks->emplace_back(std::move(res.GetValue()));
+
+  // return storage of locked slotrange
+  return srv_->cluster->CanExecByMySelf(cmd_flags, slotrange_name, std::string(), slot, true);
 }
 
-void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
-  const Config *config = srv_->GetConfig();
-  std::string reply;
-  const std::string &password = config->requirepass;
+Status Connection::getExecLocks(uint64_t cmd_flags, const std::string &slot_range_name, const CommandAttributes *attr,
+                                const CommandTokens &cmd_token, Context *ctx,
+                                std::vector<std::unique_ptr<KeyLock>> *key_locks,
+                                std::vector<std::unique_ptr<SlotRangeLock>> *sr_locks) {
+  if (cmd_flags & kCmdWrite) {
+    auto &range = attr->GetKeyRange(cmd_token);
+    for (size_t idx = range.first_key;
+         range.last_key > 0 ? idx <= size_t(range.last_key) : idx <= cmd_token.size() + range.last_key;
+         idx += range.key_step) {
+      // check multi key are in same slotrange
+      auto s = srv_->cluster->CheckKeyInSlotRange(slot_range_name, cmd_token[idx]);
+      if (!s.IsOK()) {
+        LOG(WARNING) << "cmd:" << attr->name << ", keys not in same slotrange, " << s.Msg();
+        return Status{Status::CrossSlotRange, "CROSSSLOTRANGE Keys in request don't hash to the same slot range"};
+      }
+      // get key's mgl
+      auto res =
+          KeyLock::AcquireKeyLock(slot_range_name, cmd_token[idx], mgl::LockMode::LOCK_X, ctx, srv_->GetMGLockMgr());
+      if (!res.IsOK()) {
+        LOG(ERROR) << "Failed to get key lock, cmd:" << attr->name << ", key:" << cmd_token[idx]
+                   << ", Err: " << res.Msg();
+        return Status{Status::NotOK, res.Msg()};
+      }
+      // Lock same key will get nullptr if lock has been taken
+      if (res.GetValue() != nullptr) {
+        key_locks->emplace_back(std::move(res.GetValue()));
+      }
+    }
+  } else {
+    // get SlotRange LOCK_IS for read cmd
+    auto res = SlotRangeLock::AcquireSlotRangeLock(slot_range_name, mgl::LockMode::LOCK_IS, ctx, srv_->GetMGLockMgr());
+    if (!res.IsOK()) {
+      LOG(ERROR) << "Failed to lock slot range: " << slot_range_name << ", cmd:" << attr->name
+                 << ", Err: " << res.Msg();
+      return Status{res.Is<Status::LockTimeOut>() ? Status::LockTimeOutSlotRange : Status::NotOK, res.Msg()};
+    }
+    // check multi keys are in same slotrange, if cmd with multikey
+    if (attr->key_range.first_key != attr->key_range.last_key) {
+      auto &range = attr->GetKeyRange(cmd_token);
+      for (size_t idx = range.first_key;
+           range.last_key > 0 ? idx <= size_t(range.last_key) : idx <= cmd_token.size() + range.last_key;
+           idx += range.key_step) {
+        auto s = srv_->cluster->CheckKeyInSlotRange(slot_range_name, cmd_token[idx]);
+        if (!s.IsOK()) {
+          LOG(WARNING) << "cmd:" << attr->name << ", keys not in same slotrange, " << s.Msg();
+          return Status{Status::CrossSlotRange, "CROSSSLOTRANGE Keys in request don't hash to the same slot range"};
+        }
+      }
+    }
+    sr_locks->emplace_back(std::move(res.GetValue()));
+  }
+  return Status::OK();
+}
 
-  while (!to_process_cmds->empty()) {
-    CommandTokens cmd_tokens = std::move(to_process_cmds->front());
-    to_process_cmds->pop_front();
+Status Connection::lockAllSlotRanges(Context *ctx, mgl::LockMode mode,
+                                     std::vector<std::unique_ptr<SlotRangeLock>> *sr_locks) {
+  auto sr_names = srv_->cluster->GetAllLocalSlotRangeNames();
+  for (const auto &name : sr_names) {
+    auto res = SlotRangeLock::AcquireSlotRangeLock(name, mode, ctx, srv_->GetMGLockMgr());
+    if (!res.IsOK()) {
+      sr_locks->clear();
+      LOG(INFO) << "Failed to lock slotrange: " << name << ", Err: " << res.Msg();
+      return res.ToStatus();
+    }
+    LOG(INFO) << "Locked slotrange: " << name;
+    sr_locks->emplace_back(std::move(res.GetValue()));
+  }
+  // make sure slotranges same as locked
+  if (sr_names != srv_->cluster->GetAllLocalSlotRangeNames()) {
+    LOG(WARNING) << "Slotranges changed during locking all slotranges";
+    sr_locks->clear();
+    return Status{Status::NotOK, "Failed to lock current slotranges"};
+  }
+  return Status::OK();
+}
+
+void Connection::RecordFailAndReply(const std::string &msg, GlobalStats::RequestResult type) {
+  Reply(msg);
+  GlobalStatsInstance().IncrRequests(type);
+}
+
+void Connection::RecordFailAndReplyWithCmd(const std::string &msg, GlobalStats::RequestResult type,
+                                           const std::string &cmd_name) {
+  RecordFailAndReply(msg, type);
+  GlobalStatsInstance().IncrCalls(cmd_name, false);
+}
+
+void Connection::SetUnblocked() {
+  is_blocked_ = false;
+  bufferevent_trigger(bev_, EV_READ, 0);  // Trigger read event on connection
+}
+
+void Connection::ExecuteCommands() {
+  Config *config = srv_->GetConfig();
+  std::string reply, password = config->requirepass;
+  thread_local_metric_array.Record(MetricType::REQUESTS_BATCH_SIZE,
+                                   {{"worker_id", std::to_string(thread_local_metric_array.thread_id)}},
+                                   to_process_cmds_.size());
+
+  while (!to_process_cmds_.empty()) {
+    if (IsFlagEnabled(kCloseAsync) || IsFlagEnabled(kCloseAfterReply) || IsFlagEnabled(kReadDisabled)) {
+      return;
+    }
+    auto start = std::chrono::high_resolution_clock::now();
+    owner_->blocked_worker_start_block_time.store(std::chrono::steady_clock::now().time_since_epoch());
+    absl::Cleanup cleanup = [&block_time = owner_->blocked_worker_start_block_time] {
+      block_time.store(std::chrono::nanoseconds(0));
+    };
+
+    auto cmd_tokens = to_process_cmds_.front();
+    to_process_cmds_.pop_front();
     if (cmd_tokens.empty()) continue;
 
-    bool is_multi_exec = IsFlagEnabled(Connection::kMultiExec);
-    if (IsFlagEnabled(redis::Connection::kCloseAfterReply) && !is_multi_exec) break;
-    auto multi_error_exit = MakeScopeExit([&] {
-      if (is_multi_exec) multi_error_ = true;
-    });
-
-    auto cmd_s = Server::LookupAndCreateCommand(cmd_tokens.front());
-    if (!cmd_s.IsOK()) {
-      auto cmd_name = cmd_tokens.front();
-      if (util::EqualICase(cmd_name, "host:") || util::EqualICase(cmd_name, "post")) {
-        warn(
-            "[connection] A likely HTTP request is detected in the RESP connection, indicating a potential "
-            "Cross-Protocol Scripting attack. Connection aborted.");
-        EnableFlag(kCloseAsync);
-        return;
-      }
-      Reply(redis::Error(
-          {Status::NotOK,
-           fmt::format("unknown command `{}`, with args beginning with: {}", cmd_name,
-                       util::StringJoin(nonstd::span(cmd_tokens.begin() + 1, cmd_tokens.end()),
-                                        [](const auto &v) -> decltype(auto) { return fmt::format("`{}`", v); }))}));
+    std::unique_ptr<Commander> current_cmd;
+    auto s = srv_->LookupAndCreateCommand(cmd_tokens.front(), &current_cmd);
+    if (!s.IsOK()) {
+      RecordFailAndReply(redis::Error("ERR unknown command " + cmd_tokens.front()), GlobalStats::FAIL_USAGE_ERROR);
       continue;
     }
-    auto current_cmd = std::move(*cmd_s);
-
-    const auto &attributes = current_cmd->GetAttributes();
+    const auto attributes = current_cmd->GetAttributes();
     auto cmd_name = attributes->name;
-
-    int tokens = static_cast<int>(cmd_tokens.size());
-    if (!attributes->CheckArity(tokens)) {
-      Reply(redis::Error({Status::NotOK, "wrong number of arguments"}));
-      continue;
-    }
-
     auto cmd_flags = attributes->GenerateFlags(cmd_tokens);
+    int arity = attributes->arity;
+    int tokens = static_cast<int>(cmd_tokens.size());
+
     if (GetNamespace().empty()) {
-      if (!password.empty()) {
-        if (!(cmd_flags & kCmdAuth)) {
-          Reply(redis::Error({Status::RedisNoAuth, "Authentication required."}));
-          continue;
-        }
-      } else {
+      if (!password.empty() && util::ToLower(cmd_tokens.front()) != "auth" &&
+          util::ToLower(cmd_tokens.front()) != "hello") {
+        RecordFailAndReplyWithCmd(redis::Error("NOAUTH Authentication required."), GlobalStats::FAIL_UNCONCERNED_ERROR,
+                                  cmd_name);
+        continue;
+      }
+
+      if (password.empty()) {
         BecomeAdmin();
         SetNamespace(kDefaultNamespace);
       }
     }
 
-    std::shared_lock<std::shared_mutex> concurrency;  // Allow concurrency
-    std::unique_lock<std::shared_mutex> exclusivity;  // Need exclusivity
-    // If the command needs to process exclusively, we need to get 'ExclusivityGuard'
-    // that can guarantee other threads can't come into critical zone, such as DEBUG,
-    // CLUSTER subcommand, CONFIG SET, MULTI, LUA (in the immediate future).
-    // Otherwise, we just use 'ConcurrencyGuard' to allow all workers to execute commands at the same time.
-    if (is_multi_exec && !(cmd_flags & kCmdBypassMulti)) {
-      // No lock guard, because 'exec' command has acquired 'WorkExclusivityGuard'
-    } else if (cmd_flags & kCmdExclusive) {
-      exclusivity = srv_->WorkExclusivityGuard();
-    } else {
-      concurrency = srv_->WorkConcurrencyGuard();
-    }
-
-    if (srv_->IsLoading() && !(cmd_flags & kCmdLoading)) {
-      Reply(redis::Error({Status::RedisLoading, errRestoringBackup}));
+    if ((arity > 0 && tokens != arity) || (arity < 0 && tokens < -arity)) {
+      RecordFailAndReplyWithCmd(redis::Error("ERR wrong number of arguments"), GlobalStats::FAIL_USAGE_ERROR, cmd_name);
       continue;
     }
 
     current_cmd->SetArgs(cmd_tokens);
-    auto s = current_cmd->Parse();
+    s = current_cmd->Parse();
     if (!s.IsOK()) {
-      Reply(redis::Error(s));
-      continue;
-    }
-
-    if (is_multi_exec && (cmd_flags & kCmdNoMulti)) {
-      Reply(redis::Error({Status::NotOK, fmt::format("{} inside MULTI is not allowed", util::ToUpper(cmd_name))}));
-      continue;
-    }
-
-    if ((cmd_flags & kCmdAdmin) && !IsAdmin()) {
-      Reply(redis::Error({Status::RedisExecErr, errAdminPermissionRequired}));
-      continue;
-    }
-
-    if (config->cluster_enabled) {
-      s = srv_->cluster->CanExecByMySelf(attributes, cmd_tokens, this);
-      if (!s.IsOK()) {
-        Reply(redis::Error(s));
-        continue;
+      if (s.GetCode() == Status::ExpireTSExceedRedisLimit) {
+        RecordFailAndReplyWithCmd(redis::Error("ERR " + s.Msg()), GlobalStats::FAIL_KKV_EXPIRE_EXCEED_REDIS, cmd_name);
+      } else if (s.GetCode() == Status::CmdDisabled) {
+        RecordFailAndReplyWithCmd(redis::Error("ERR " + s.Msg()), GlobalStats::FAIL_DISABLED_CMD, cmd_name);
+      } else {
+        RecordFailAndReplyWithCmd(redis::Error("ERR " + s.Msg()), GlobalStats::FAIL_USAGE_ERROR, cmd_name);
       }
-    }
-
-    // reset the ASKING flag after executing the next query
-    if (IsFlagEnabled(kAsking)) {
-      DisableFlag(kAsking);
-    }
-
-    multi_error_exit.Disable();
-    // We don't execute commands, but queue them, and then execute in EXEC command
-    if (is_multi_exec && !in_exec_ && !(cmd_flags & kCmdBypassMulti)) {
-      multi_cmds_.emplace_back(std::move(cmd_tokens));
-      Reply(redis::SimpleString("QUEUED"));
       continue;
     }
 
-    if (config->slave_readonly && srv_->IsSlave() && (cmd_flags & kCmdWrite)) {
-      Reply(redis::Error({Status::RedisReadOnly, "You can't write against a read only slave."}));
+    // check cluster topo has inited
+    if (!srv_->cluster->TopoHasInited()) {
+      RecordFailAndReplyWithCmd(redis::Error("ERR cluster is not running"), GlobalStats::FAIL_UNCONCERNED_ERROR,
+                                cmd_name);
       continue;
     }
 
-    if ((cmd_flags & kCmdWrite) && !(cmd_flags & kCmdNoDBSizeCheck) && srv_->storage->ReachedDBSizeLimit()) {
-      Reply(redis::Error({Status::NotOK, "write command not allowed when reached max-db-size."}));
-      continue;
-    }
+    engine::Storage *storage = nullptr;
+    Context ctx;
+    std::vector<std::unique_ptr<KeyLock>> key_locks;
+    std::vector<std::unique_ptr<SlotRangeLock>> sr_locks;
+    auto key_range = attributes->GetKeyRange(cmd_tokens);
+    std::string slot_range_name = "unknown";
+    // NOTE(mingfo): We determine whether a command is a data operation based on if it includes a key.
+    if (key_range.first_key != 0) {
+      // check multi keys in same slot of lua cmd
+      bool need_lock = true;
+      if (cmd_flags & kCmdScript) {
+        // NOTE(mingfo): 'numkeys >= 0' which is varified in 'cmd->Parse()'.
+        auto numkeys = ParseInt<int64_t>(cmd_tokens[2], 10).GetValue();
+        if (numkeys != 0) {
+          s = CheckKeysInSameSlot(attributes, cmd_tokens);
+          if (!s.IsOK()) {
+            RecordFailAndReplyWithCmd(redis::Error("ERR " + s.Msg()), GlobalStats::FAIL_USAGE_ERROR, cmd_name);
+            continue;
+          }
+        } else {
+          // For eval/evalsha with 'numkeys == 0'
+          need_lock = false;
+        }
+      }
 
-    if (!config->slave_serve_stale_data && srv_->IsSlave() && !IsCmdAllowedInStaleData(cmd_name) &&
-        srv_->GetReplicationState() != kReplConnected) {
-      Reply(redis::Error({Status::RedisMasterDown,
-                          "Link with MASTER is down "
-                          "and slave-serve-stale-data is set to 'no'."}));
-      continue;
-    }
+      if (need_lock) {
+        // get slotrange by key
+        slot_range_name = srv_->cluster->GetSlotRangeNameByKey(cmd_tokens[key_range.first_key]);
 
-    ScopeExit in_script_exit{[this] { in_script_ = false; }, false};
-    if (attributes->category == CommandCategory::Script || attributes->category == CommandCategory::Function) {
-      in_script_ = true;
-      in_script_exit.Enable();
+        // get shared or exclusive lock for cmd
+        s = getExecLocks(cmd_flags, slot_range_name, attributes, cmd_tokens, &ctx, &key_locks, &sr_locks);
+        if (!s.IsOK()) {
+          if (s.Is<Status::LockTimeOutSlotRange>()) {
+            RecordFailAndReplyWithCmd(redis::Error("ERR " + s.Msg()), GlobalStats::FAIL_SLOTRANGE_LOCK_TIMEOUT,
+                                      cmd_name);
+          } else if (s.Is<Status::CrossSlotRange>()) {
+            RecordFailAndReplyWithCmd(redis::Error(s.Msg()), GlobalStats::FAIL_UNCONCERNED_ERROR, cmd_name);
+          } else {
+            RecordFailAndReplyWithCmd(redis::Error("ERR " + s.Msg()), GlobalStats::FAIL_UNCONCERNED_ERROR, cmd_name);
+          }
+          continue;
+        }
+
+        // check slotrange
+        auto ret = srv_->cluster->CanExecByMySelf(cmd_flags, slot_range_name, cmd_tokens[key_range.first_key]);
+        if (!ret.IsOK()) {
+          if (ret.IsRetry()) {
+            if (ret.Is<Status::ClusterRetryWriteStopped>()) {
+              is_blocked_ = true;
+              to_process_cmds_.push_front(std::move(cmd_tokens));
+              return;
+            } else {
+              RecordFailAndReplyWithCmd(redis::Error(ret.Msg()), GlobalStats::FAIL_UNCONCERNED_ERROR, cmd_name);
+            }
+          } else {
+            RecordFailAndReplyWithCmd(redis::Error("ERR " + ret.Msg()), GlobalStats::FAIL_UNCONCERNED_ERROR, cmd_name);
+          }
+          continue;
+        }
+        // get storage of target slotrange
+        storage = ret.GetValue().get();  // TODO: use shared_ptr
+      }
+    } else {
+      if (cmd_flags & CommandFlags::kCmdScript) {
+        auto s = HandleCmdScript(&ctx, &sr_locks);
+        if (!s.IsOK()) {
+          LOG(WARNING) << "Failed to handle cmd:" << cmd_name << ", Err: " << s.Msg();
+          if (s.Is<Status::LockTimeOutSlotRange>()) {
+            RecordFailAndReplyWithCmd(redis::Error("ERR " + s.Msg()), GlobalStats::FAIL_SLOTRANGE_LOCK_TIMEOUT,
+                                      cmd_name);
+          } else {
+            RecordFailAndReplyWithCmd(redis::Error("ERR " + s.Msg()), GlobalStats::FAIL_UNCONCERNED_ERROR, cmd_name);
+          }
+          continue;
+        }
+      } else if (attributes->name == "nodescan") {
+        auto ret = HandleCmdNodeScan(cmd_flags, current_cmd, &ctx, &sr_locks);
+        if (!ret.IsOK()) {
+          if (ret.IsRetry()) {
+            RecordFailAndReplyWithCmd(redis::Error(ret.Msg()), GlobalStats::FAIL_UNCONCERNED_ERROR, cmd_name);
+          } else if (s.Is<Status::LockTimeOutSlotRange>()) {
+            RecordFailAndReplyWithCmd(redis::Error("ERR " + s.Msg()), GlobalStats::FAIL_SLOTRANGE_LOCK_TIMEOUT,
+                                      cmd_name);
+          } else {
+            RecordFailAndReplyWithCmd(redis::Error("ERR " + ret.Msg()), GlobalStats::FAIL_UNCONCERNED_ERROR, cmd_name);
+          }
+          continue;
+        }
+        // get storage of target slotrange
+        storage = ret.GetValue().get();  // TODO: use shared_ptr
+      }
     }
 
     SetLastCmd(cmd_name);
-    {
-      std::optional<MultiLockGuard> guard;
-      if (cmd_flags & kCmdWrite) {
-        std::vector<std::string> lock_keys;
-        attributes->ForEachKeyRange(
-            [&lock_keys, this](const std::vector<std::string> &args, const CommandKeyRange &key_range) {
-              key_range.ForEachKey(
-                  [&, this](const std::string &key) {
-                    auto ns_key = ComposeNamespaceKey(ns_, key, srv_->storage->IsSlotIdEncoded());
-                    lock_keys.emplace_back(std::move(ns_key));
-                  },
-                  args);
-            },
-            cmd_tokens);
 
-        guard.emplace(srv_->storage->GetLockManager(), lock_keys);
-      }
-      engine::Context ctx(srv_->storage);
+    bool is_profiling = IsProfilingEnabled(cmd_name);
+    auto end = std::chrono::high_resolution_clock::now();
+    int64_t prepare_duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 
-      std::vector<GlobalIndexer::RecordResult> index_records;
-      if (!srv_->index_mgr.index_map.empty() && IsCmdForIndexing(cmd_flags, attributes->category) &&
-          !config->cluster_enabled) {
-        attributes->ForEachKeyRange(
-            [&, this](const std::vector<std::string> &args, const CommandKeyRange &key_range) {
-              key_range.ForEachKey(
-                  [&, this](const std::string &key) {
-                    auto res = srv_->indexer.Record(ctx, key, ns_);
-                    if (res.IsOK()) {
-                      index_records.push_back(*res);
-                    } else if (!res.Is<Status::NoPrefixMatched>() && !res.Is<Status::TypeMismatched>()) {
-                      warn("[connection] index recording failed for key: {}", key);
-                    }
-                  },
-                  args);
-            },
-            cmd_tokens);
-      }
+    int64_t command_queue_latency =
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start_processing_time_)
+            .count();
 
-      s = ExecuteCommand(ctx, cmd_name, cmd_tokens, current_cmd.get(), &reply);
-      for (const auto &record : index_records) {
-        auto s = GlobalIndexer::Update(ctx, record);
-        if (!s.IsOK() && !s.Is<Status::TypeMismatched>()) {
-          warn("[connection] index updating failed for key: {}", record.key);
-        }
-      }
+    if (command_queue_latency >= 0) {
+      thread_local_metric_array.Record(MetricType::COMMAND_QUEUE_LATENCY_ON_CONNECTION,
+                                       {{"worker_id", std::to_string(thread_local_metric_array.thread_id)}},
+                                       static_cast<uint64_t>(command_queue_latency));
     }
-
+    s = current_cmd->Execute(srv_, this, &reply, storage);  // TODO: use shared_ptr
+    end = std::chrono::high_resolution_clock::now();
+    uint64_t duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+    std::optional<std::pair<std::string, std::string>> perf_io_context;
+    srv_->SlowlogPushEntryIfNeeded(&cmd_tokens, duration, this, is_profiling, perf_io_context, prepare_duration,
+                                   command_queue_latency, static_cast<int64_t>(current_cmd->GetEstimatedSubkeyNum()));
+    if (is_profiling)
+      RecordProfilingSampleIfNeed(cmd_name, duration, std::move(perf_io_context), prepare_duration,
+                                  command_queue_latency);
+    GlobalStatsInstance().IncrSlowQueryCallsIfNeeded(static_cast<uint64_t>(duration));
     srv_->FeedMonitorConns(this, cmd_tokens);
-
-    // Break the execution loop when occurring the blocking command like BLPOP or BRPOP,
-    // it will suspend the connection and wait for the wakeup signal.
-    if (s.Is<Status::BlockingCmd>()) {
-      // For the blocking command, it will use the command while resumed from the suspend state.
-      // So we need to save the command for the next execution.
-      // Migrate connection would also check the saved_current_command_ to determine whether
-      // the connection can be migrated or not.
-      saved_current_command_ = std::move(current_cmd);
-      break;
-    }
 
     // Reply for MULTI
     if (!s.IsOK()) {
-      Reply(redis::Error(s));
+      if (!(cmd_flags & CommandFlags::kCmdScript)) {
+        auto idx = s.Msg().find(':');
+        RecordFailAndReplyWithCmd(
+            redis::Error("ERR " + ((idx == std::string::npos) ? s.Msg() : s.Msg().substr(idx + 2))),
+            GlobalStats::FAIL_UNCONCERNED_ERROR, cmd_name);  // TODO(chris): refactor
+      } else {
+        RecordFailAndReplyWithCmd(redis::Error("ERR " + s.Msg()), GlobalStats::FAIL_UNCONCERNED_ERROR, cmd_name);
+      }
       continue;
     }
 
-    srv_->UpdateWatchedKeysFromArgs(cmd_tokens, *attributes);
-
-    if (!reply.empty()) Reply(reply);
+    GlobalStatsInstance().IncrRequests(GlobalStats::SUCCEED);
+    GlobalStatsInstance().IncrCalls(cmd_name, true);
+    // only record latency of success requests.
+    thread_local_metric_array.RecordCommadLatency(cmd_name, slot_range_name, duration);
+    if (!reply.empty()) {
+      thread_local_metric_array.RecordReplySize(cmd_name, slot_range_name, reply.size());
+      Reply(reply);
+    }
+    thread_local_metric_array.RecordCommadSize(cmd_name, slot_range_name, current_cmd->GetEstimatedSubkeyNum(),
+                                               current_cmd->GetEstimatedSubkeySize());
     reply.clear();
   }
 }

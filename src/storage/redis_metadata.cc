@@ -27,9 +27,12 @@
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
+#include <iostream>
+#include <string_view>
 
 #include "cluster/redis_slot.h"
 #include "encoding.h"
+#include "glog/logging.h"
 #include "time_util.h"
 
 // 52 bit for microseconds and 11 bit for counter
@@ -38,13 +41,12 @@ const int VersionCounterBits = 11;
 static std::atomic<uint64_t> version_counter_ = 0;
 
 constexpr const char *kErrMetadataTooShort = "metadata is too short";
+constexpr const char *kErrHashSubKVTooShort = "hash subkey value is too short";
+
+std::atomic<bool> encode_hash_sub_flag{false};
 
 InternalKey::InternalKey(Slice input, bool slot_id_encoded) : slot_id_encoded_(slot_id_encoded) {
   uint32_t key_size = 0;
-  uint8_t namespace_size = 0;
-  GetFixed8(&input, &namespace_size);
-  namespace_ = Slice(input.data(), namespace_size);
-  input.remove_prefix(namespace_size);
   if (slot_id_encoded_) {
     GetFixed16(&input, &slotid_);
   }
@@ -57,17 +59,13 @@ InternalKey::InternalKey(Slice input, bool slot_id_encoded) : slot_id_encoded_(s
 
 InternalKey::InternalKey(Slice ns_key, Slice sub_key, uint64_t version, bool slot_id_encoded)
     : sub_key_(sub_key), version_(version), slot_id_encoded_(slot_id_encoded) {
-  uint8_t namespace_size = 0;
-  GetFixed8(&ns_key, &namespace_size);
-  namespace_ = Slice(ns_key.data(), namespace_size);
-  ns_key.remove_prefix(namespace_size);
   if (slot_id_encoded_) {
     GetFixed16(&ns_key, &slotid_);
   }
   key_ = ns_key;
 }
 
-Slice InternalKey::GetNamespace() const { return namespace_; }
+Slice InternalKey::GetNamespace() const { return "__namespace"; }
 
 Slice InternalKey::GetKey() const { return key_; }
 
@@ -77,14 +75,12 @@ uint64_t InternalKey::GetVersion() const { return version_; }
 
 std::string InternalKey::Encode() const {
   std::string out;
-  size_t total = 1 + namespace_.size() + 4 + key_.size() + 8 + sub_key_.size();
+  size_t total = 4 + key_.size() + 8 + sub_key_.size();
   if (slot_id_encoded_) {
     total += 2;
   }
   out.resize(total);
   auto buf = out.data();
-  buf = EncodeFixed8(buf, static_cast<uint8_t>(namespace_.size()));
-  buf = EncodeBuffer(buf, namespace_);
   if (slot_id_encoded_) {
     buf = EncodeFixed16(buf, slotid_);
   }
@@ -96,37 +92,20 @@ std::string InternalKey::Encode() const {
 }
 
 bool InternalKey::operator==(const InternalKey &that) const {
-  if (namespace_ != this->namespace_) return false;
   if (key_ != that.key_) return false;
   if (sub_key_ != that.sub_key_) return false;
   return version_ == that.version_;
 }
 
-// Must slot encoded
-uint16_t ExtractSlotId(Slice ns_key) {
-  uint8_t namespace_size = 0;
-  GetFixed8(&ns_key, &namespace_size);
-  ns_key.remove_prefix(namespace_size);
-
-  uint16_t slot_id = HASH_SLOTS_SIZE;
-  GetFixed16(&ns_key, &slot_id);
-  return slot_id;
-}
-
 template <typename T>
 std::tuple<T, T> ExtractNamespaceKey(Slice ns_key, bool slot_id_encoded) {
-  uint8_t namespace_size = 0;
-  GetFixed8(&ns_key, &namespace_size);
-  T ns(ns_key.data(), namespace_size);
-  ns_key.remove_prefix(namespace_size);
-
   if (slot_id_encoded) {
     uint16_t slot_id = 0;
     GetFixed16(&ns_key, &slot_id);
   }
 
   T key = {ns_key.data(), ns_key.size()};
-  return {ns, key};
+  return {"__namespace", key};
 }
 
 template std::tuple<Slice, Slice> ExtractNamespaceKey<Slice>(Slice ns_key, bool slot_id_encoded);
@@ -134,9 +113,6 @@ template std::tuple<std::string, std::string> ExtractNamespaceKey<std::string>(S
 
 std::string ComposeNamespaceKey(const Slice &ns, const Slice &key, bool slot_id_encoded) {
   std::string ns_key;
-
-  PutFixed8(&ns_key, static_cast<uint8_t>(ns.size()));
-  ns_key.append(ns.data(), ns.size());
 
   if (slot_id_encoded) {
     auto slot_id = GetSlotIdFromKey(key.ToStringView());
@@ -150,38 +126,71 @@ std::string ComposeNamespaceKey(const Slice &ns, const Slice &key, bool slot_id_
 
 std::string ComposeSlotKeyPrefix(const Slice &ns, int slotid) {
   std::string output;
-
-  PutFixed8(&output, static_cast<uint8_t>(ns.size()));
-  output.append(ns.data(), ns.size());
-
   PutFixed16(&output, static_cast<uint16_t>(slotid));
 
   return output;
 }
 
-std::string ComposeSlotKeyUpperBound(const Slice &ns, int slotid) { return ComposeSlotKeyPrefix(ns, slotid + 1); }
+RedisType GetRedisTypeByName(const std::string &type_str) {
+  std::string name = util::ToLower(type_str);
+  if (!strcasecmp(type_str.c_str(), "string")) return RedisType::kRedisString;
+  if (!strcasecmp(name.c_str(), "hash")) return RedisType::kRedisHash;
+  if (!strcasecmp(name.c_str(), "list")) return RedisType::kRedisList;
+  if (!strcasecmp(name.c_str(), "set")) return RedisType::kRedisSet;
+  if (!strcasecmp(name.c_str(), "zset")) return RedisType::kRedisZSet;
+  if (!strcasecmp(name.c_str(), "bitmap")) return RedisType::kRedisBitmap;
+  if (!strcasecmp(name.c_str(), "sortedint")) return RedisType::kRedisSortedint;
+  if (!strcasecmp(name.c_str(), "stream")) return RedisType::kRedisStream;
+  if (!strcasecmp(name.c_str(), "MBbloom--")) return RedisType::kRedisBloomFilter;
+  if (!strcasecmp(name.c_str(), "ReJSON-RL")) return RedisType::kRedisJson;
+  return RedisType::kRedisNone;
+}
 
-Metadata::Metadata(RedisType type, bool generate_version, bool use_64bit_common_field)
-    : flags((use_64bit_common_field ? METADATA_64BIT_ENCODING_MASK : 0) | (METADATA_TYPE_MASK & type)),
+Metadata::Metadata(RedisType type, bool generate_version)
+    : flags(METADATA_TYPE_MASK & type),
       expire(0),
       version(generate_version ? generateVersion() : 0),
-      size(0) {}
+      size(0),
+      persist_field_size(0),
+      fields_max_expire_at(0) {
+  if (type == kRedisHash && encode_hash_sub_flag.load()) {
+    this->flags |= METADATA_HAS_SUB_FLAG_MASK;
+  }
+}
 
 rocksdb::Status Metadata::Decode(Slice *input) {
   if (!GetFixed8(input, &flags)) {
     return rocksdb::Status::InvalidArgument(kErrMetadataTooShort);
   }
 
-  if (!GetExpire(input)) {
-    return rocksdb::Status::InvalidArgument(kErrMetadataTooShort);
+  if (HasTTL()) {
+    if (!GetExpire(input)) {
+      return rocksdb::Status::InvalidArgument(kErrMetadataTooShort);
+    }
+  } else {
+    expire = 0;
   }
 
   if (!IsSingleKVType()) {
-    if (input->size() < 8 + CommonEncodedSize()) {
+    if (input->size() < 8 + CommonEncodedSize()) {  // sizeof(version) + sizeof(size)
       return rocksdb::Status::InvalidArgument(kErrMetadataTooShort);
     }
     GetFixed64(input, &version);
     GetFixedCommon(input, &size);
+  }
+
+  if (Type() == kRedisHash) {
+    if (IsSubTTLSet()) {
+      if (!GetFixed64(input, &persist_field_size)) {
+        return rocksdb::Status::InvalidArgument(kErrMetadataTooShort);
+      }
+      if (!GetFixed64(input, &fields_max_expire_at)) {
+        return rocksdb::Status::InvalidArgument(kErrMetadataTooShort);
+      }
+    } else {
+      persist_field_size = 0;
+      fields_max_expire_at = 0;
+    }
   }
 
   return rocksdb::Status::OK();
@@ -189,13 +198,27 @@ rocksdb::Status Metadata::Decode(Slice *input) {
 
 rocksdb::Status Metadata::Decode(Slice input) { return Decode(&input); }
 
-void Metadata::Encode(std::string *dst) const {
-  PutFixed8(dst, flags);
-  PutExpire(dst);
+void Metadata::Encode(std::string *dst) {
+  if (expire > 0) {
+    flags |= METADATA_TTL_MASK;
+    PutFixed8(dst, flags);
+    PutExpire(dst);
+  } else {
+    flags &= ~METADATA_TTL_MASK;
+    PutFixed8(dst, flags);
+  }
+
   if (!IsSingleKVType()) {
     PutFixed64(dst, version);
     PutFixedCommon(dst, size);
   }
+  if (Type() == kRedisHash) {
+    if (HasSubFlag() && IsSubTTLSet()) {
+      PutFixed64(dst, persist_field_size);
+      PutFixed64(dst, fields_max_expire_at);
+    }
+  }
+  DCHECK_NE(flags & CONFLICT_TTL_AND_SUB_TTL_MASK, CONFLICT_TTL_AND_SUB_TTL_MASK);
 }
 
 void Metadata::InitVersionCounter() {
@@ -217,27 +240,27 @@ bool Metadata::operator==(const Metadata &that) const {
     if (size != that.size) return false;
     if (version != that.version) return false;
   }
+  if (Type() == kRedisHash) {
+    if (persist_field_size != that.persist_field_size) return false;
+    if (fields_max_expire_at != that.fields_max_expire_at) return false;
+  }
   return true;
 }
 
 RedisType Metadata::Type() const { return static_cast<RedisType>(flags & METADATA_TYPE_MASK); }
 
-std::string_view Metadata::TypeName() const { return RedisTypeNames[Type()]; }
-
 size_t Metadata::GetOffsetAfterExpire(uint8_t flags) {
-  if (flags & METADATA_64BIT_ENCODING_MASK) {
+  if (Metadata::HasTTL(flags)) {
     return 1 + 8;
   }
-
-  return 1 + 4;
+  return 1;
 }
 
 size_t Metadata::GetOffsetAfterSize(uint8_t flags) {
-  if (flags & METADATA_64BIT_ENCODING_MASK) {
-    return 1 + 8 + 8 + 8;
+  if (Metadata::HasTTL(flags)) {
+    return 1 + 8 + 8;
   }
-
-  return 1 + 4 + 8 + 4;
+  return 1 + 8;
 }
 
 uint64_t Metadata::ExpireMsToS(uint64_t ms) {
@@ -253,7 +276,7 @@ uint64_t Metadata::ExpireMsToS(uint64_t ms) {
   return (ms + 499) / 1000;
 }
 
-bool Metadata::Is64BitEncoded() const { return flags & METADATA_64BIT_ENCODING_MASK; }
+bool Metadata::Is64BitEncoded() const { return true; }
 
 size_t Metadata::CommonEncodedSize() const { return Is64BitEncoded() ? 8 : 4; }
 
@@ -300,6 +323,9 @@ void Metadata::PutExpire(std::string *dst) const {
   }
 }
 
+bool Metadata::HasTTL(uint8_t flags) { return (flags & METADATA_TTL_MASK); }
+bool Metadata::HasTTL() const { return (flags & METADATA_TTL_MASK); }
+
 int64_t Metadata::TTL() const {
   if (expire == 0) {
     return -1;
@@ -333,16 +359,24 @@ bool Metadata::ExpireAt(uint64_t expired_ts) const {
 bool Metadata::IsSingleKVType() const { return Type() == kRedisString || Type() == kRedisJson; }
 
 bool Metadata::IsEmptyableType() const {
-  return IsSingleKVType() || Type() == kRedisStream || Type() == kRedisBloomFilter || Type() == kRedisHyperLogLog ||
-         Type() == kRedisTDigest || Type() == kRedisTimeSeries;
+  return IsSingleKVType() || Type() == kRedisStream || Type() == kRedisBloomFilter;
 }
 
-bool Metadata::Expired() const { return ExpireAt(util::GetTimeStampMS()); }
+bool Metadata::Expired() const {
+  if (Type() == kRedisHash && IsSubTTLSet()) {
+    return persist_field_size == 0 && fields_max_expire_at < util::GetTimeStampMS();
+  }
+  return ExpireAt(util::GetTimeStampMS());
+}
+
+bool Metadata::HasSubFlag() const { return flags & METADATA_HAS_SUB_FLAG_MASK; }
+
+bool Metadata::IsSubTTLSet() const { return flags & METADATA_SUB_TTL_SET_MASK; }
 
 ListMetadata::ListMetadata(bool generate_version)
     : Metadata(kRedisList, generate_version), head(UINT64_MAX / 2), tail(head) {}
 
-void ListMetadata::Encode(std::string *dst) const {
+void ListMetadata::Encode(std::string *dst) {
   Metadata::Encode(dst);
   PutFixed64(dst, head);
   PutFixed64(dst, tail);
@@ -352,17 +386,133 @@ rocksdb::Status ListMetadata::Decode(Slice *input) {
   if (auto s = Metadata::Decode(input); !s.ok()) {
     return s;
   }
-
-  if (input->size() < 8 + 8) {
-    return rocksdb::Status::InvalidArgument(kErrMetadataTooShort);
+  if (Type() == kRedisList) {
+    if (input->size() < 8 + 8) {
+      return rocksdb::Status::InvalidArgument(kErrMetadataTooShort);
+    }
+    GetFixed64(input, &head);
+    GetFixed64(input, &tail);
   }
-  GetFixed64(input, &head);
-  GetFixed64(input, &tail);
-
   return rocksdb::Status::OK();
 }
 
-void StreamMetadata::Encode(std::string *dst) const {
+HashMetadata::HashMetadata(bool generate_version) : Metadata(kRedisHash, generate_version) {}
+
+rocksdb::Status HashMetadata::SetSubTTL(uint64_t persist_field_size, uint64_t fields_max_expire_at) {
+  if (HasTTL()) {
+    return rocksdb::Status::InvalidArgument("cannot set sub ttl when meta key has ttl");
+  }
+  // old version, no sub key flag
+  if (!HasSubFlag()) {
+    return rocksdb::Status::InvalidArgument("cannot set sub ttl when meta key has no sub flag");
+  }
+  flags |= METADATA_SUB_TTL_SET_MASK;
+  this->persist_field_size = persist_field_size;
+  this->fields_max_expire_at = fields_max_expire_at;
+  return rocksdb::Status::OK();
+}
+
+HashSubData::HashSubData(Slice value) : flags(0), expire(0), value(value) {}
+
+bool HashSubData::HasTTL() const { return (flags & HASH_SUB_KEY_HAS_TTL_MASK); }
+
+bool HashSubData::Expired(uint64_t curr_ts) const {
+  if (HasTTL()) {
+    return curr_ts == 0 ? expire < util::GetTimeStampMS() : expire < curr_ts;
+  }
+  return false;
+}
+
+bool HashSubData::operator==(const HashSubData &rhs) const {
+  return flags == rhs.flags && expire == rhs.expire && value == rhs.value;
+}
+
+bool HashSubData::operator!=(const HashSubData &rhs) const { return !((*this) == rhs); }
+
+void HashSubData::Encode(Metadata *metadata, std::string *dst) const {
+  // old version, no sub key flag
+  if (!metadata->HasSubFlag()) {
+    dst->append(value.data(), value.size());
+    return;
+  }
+  PutFixed8(dst, flags);
+  if (HasTTL()) {
+    PutFixed64(dst, expire);
+  }
+  dst->append(value.data(), value.size());
+}
+
+rocksdb::Status HashSubData::Decode(Metadata *metadata, rocksdb::PinnableSlice *input, uint64_t curr_ts) {
+  DCHECK(metadata != nullptr);
+  DCHECK(input != nullptr);
+  rocksdb::Slice s = rocksdb::Slice(input->data(), input->size());
+  return Decode(metadata->HasSubFlag(), s, curr_ts);
+}
+
+rocksdb::Status HashSubData::Decode(Metadata *metadata, std::string *input, uint64_t curr_ts) {
+  DCHECK(metadata != nullptr);
+  DCHECK(input != nullptr);
+  rocksdb::Slice s = rocksdb::Slice(input->data(), input->size());
+  return Decode(metadata->HasSubFlag(), s, curr_ts);
+}
+
+rocksdb::Status HashSubData::Decode(Metadata *metadata, rocksdb::Slice input, uint64_t curr_ts) {
+  DCHECK(metadata != nullptr);
+  DCHECK(input != nullptr);
+  return Decode(metadata->HasSubFlag(), input, curr_ts);
+}
+
+rocksdb::Status HashSubData::Decode(bool has_sub_flag, rocksdb::Slice input, uint64_t curr_ts, bool keep_result) {
+  DCHECK(input != nullptr);
+  // old version, no sub key flag
+  value = input;
+  if (!has_sub_flag) {
+    flags = 0;
+    expire = 0;
+    return rocksdb::Status::OK();
+  }
+
+  if (!GetFixed8(&value, &flags)) {
+    return rocksdb::Status::InvalidArgument(kErrHashSubKVTooShort);
+  }
+
+  if (HasTTL()) {
+    if (!GetFixed64(&value, &expire)) {
+      return rocksdb::Status::InvalidArgument(kErrHashSubKVTooShort);
+    }
+  }
+  if (Expired(curr_ts)) {
+    // NOTE(mingfo): The decoded data may be used during parsing the WriteBatch in WriteBatchExtractor,
+    // here the keep_result flag determines whether to retain it.
+    if (!keep_result) Reset();
+    return rocksdb::Status::NotFound("hash subkey expired");
+  }
+  return rocksdb::Status::OK();
+}
+
+void HashSubData::SetExpire(uint64_t expire) {
+  if (expire == 0) {
+    flags &= ~HASH_SUB_KEY_HAS_TTL_MASK;
+  } else {
+    flags |= HASH_SUB_KEY_HAS_TTL_MASK;
+  }
+  this->expire = expire;
+}
+
+void HashSubData::ClearExpire() {
+  flags &= ~HASH_SUB_KEY_HAS_TTL_MASK;
+  expire = 0;
+}
+
+void HashSubData::Reset() {
+  flags = 0;
+  expire = 0;
+  value = Slice();
+}
+
+void HashSubData::SetValue(Slice value) { this->value = value; }
+
+void StreamMetadata::Encode(std::string *dst) {
   Metadata::Encode(dst);
 
   PutFixed64(dst, last_generated_id.ms);
@@ -417,7 +567,7 @@ rocksdb::Status StreamMetadata::Decode(Slice *input) {
   return rocksdb::Status::OK();
 }
 
-void BloomChainMetadata::Encode(std::string *dst) const {
+void BloomChainMetadata::Encode(std::string *dst) {
   Metadata::Encode(dst);
 
   PutFixed16(dst, n_filters);
@@ -460,7 +610,7 @@ uint32_t BloomChainMetadata::GetCapacity() const {
   return static_cast<uint32_t>(base_capacity * (1 - pow(expansion, n_filters)) / (1 - expansion));
 }
 
-void JsonMetadata::Encode(std::string *dst) const {
+void JsonMetadata::Encode(std::string *dst) {
   Metadata::Encode(dst);
 
   PutFixed8(dst, uint8_t(format));
@@ -478,92 +628,137 @@ rocksdb::Status JsonMetadata::Decode(Slice *input) {
   return rocksdb::Status::OK();
 }
 
-void HyperLogLogMetadata::Encode(std::string *dst) const {
-  Metadata::Encode(dst);
-  PutFixed8(dst, static_cast<uint8_t>(this->encode_type));
+// Batch extractor funcs
+RedisHashCommand GetHashCmdEqType(RedisHashCommand cmd_type) {
+  switch (cmd_type) {
+    case RedisHashCommand::kCmdHIncrby:
+    case RedisHashCommand::kCmdHIncrbyFloat:
+    case RedisHashCommand::kCmdHSet:
+    case RedisHashCommand::kCmdHSetNX:
+    case RedisHashCommand::kCmdHMSet:
+      return RedisHashCommand::kCmdHSet;
+    case RedisHashCommand::kCmdHDel:
+      return RedisHashCommand::kCmdHDel;
+    case RedisHashCommand::kCmdHExpire:
+    case RedisHashCommand::kCmdHExpireAt:
+    case RedisHashCommand::kCmdHPExpire:
+    case RedisHashCommand::kCmdHPExpireAt:
+      return RedisHashCommand::kCmdHPExpireAt;
+    case RedisHashCommand::kCmdHPersist:
+      return RedisHashCommand::kCmdHPersist;
+    // kkv cmds
+    case RedisHashCommand::kCmdKKVHSet:
+    case RedisHashCommand::kCmdKKVHCAS:
+      return RedisHashCommand::kCmdKKVHSet;
+    case RedisHashCommand::kCmdKKVHSetNX:
+      return RedisHashCommand::kCmdKKVHSetNX;
+    case RedisHashCommand::kCmdKKVHCAD:
+      return RedisHashCommand::kCmdHDel;
+    case RedisHashCommand::kCmdKKVHRemRangeByLex:
+      return RedisHashCommand::kCmdKKVHRemRangeByLex;
+
+    default:
+      return RedisHashCommand::kCmdNone;
+  }
+  return RedisHashCommand::kCmdNone;
 }
 
-rocksdb::Status HyperLogLogMetadata::Decode(Slice *input) {
-  if (auto s = Metadata::Decode(input); !s.ok()) {
-    return s;
+RedisStringCommand GetStringCmdEqType(RedisStringCommand cmd_type) {
+  switch (cmd_type) {
+    case RedisStringCommand::kCmdSet:
+    case RedisStringCommand::kCmdSetEX:
+    case RedisStringCommand::kCmdSetNX:
+    case RedisStringCommand::kCmdMSet:
+    case RedisStringCommand::kCmdIncr:
+    case RedisStringCommand::kCmdIncrBy:
+    case RedisStringCommand::kCmdIncrByFloat:
+    case RedisStringCommand::kCmdDecr:
+    case RedisStringCommand::kCmdDecrBy:
+      return RedisStringCommand::kCmdSet;
+    default:
+      break;
   }
-
-  uint8_t encoded_type = 0;
-  if (!GetFixed8(input, &encoded_type)) {
-    return rocksdb::Status::InvalidArgument(kErrMetadataTooShort);
-  }
-  // Check validity of encode type
-  if (encoded_type > 0) {
-    return rocksdb::Status::InvalidArgument(fmt::format("Invalid encode type {}", encoded_type));
-  }
-  this->encode_type = static_cast<EncodeType>(encoded_type);
-
-  return rocksdb::Status::OK();
+  return RedisStringCommand::kCmdNone;
 }
 
-void TDigestMetadata::Encode(std::string *dst) const {
-  Metadata::Encode(dst);
-  PutFixed32(dst, compression);
-  PutFixed32(dst, capacity);
-  PutFixed64(dst, unmerged_nodes);
-  PutFixed64(dst, merged_nodes);
-  PutFixed64(dst, total_weight);
-  PutFixed64(dst, merged_weight);
-  PutDouble(dst, minimum);
-  PutDouble(dst, maximum);
-  PutFixed64(dst, total_observations);
-  PutFixed64(dst, merge_times);
+RedisListCommand GetListCmdEqType(RedisListCommand cmd_type) {
+  switch (cmd_type) {
+    case RedisListCommand::kCmdLPush:
+    case RedisListCommand::kCmdLPushX:
+      return RedisListCommand::kCmdLPush;
+    case RedisListCommand::kCmdRPush:
+    case RedisListCommand::kCmdRPushX:
+      return RedisListCommand::kCmdRPush;
+    case RedisListCommand::kCmdLPop:
+      return RedisListCommand::kCmdLPop;
+    case RedisListCommand::kCmdRPop:
+      return RedisListCommand::kCmdRPop;
+    case RedisListCommand::kCmdLRem:
+      return RedisListCommand::kCmdLRem;
+    case RedisListCommand::kCmdLTrim:
+      return RedisListCommand::kCmdLTrim;
+    case RedisListCommand::kCmdLSet:
+      return RedisListCommand::kCmdLSet;
+    case RedisListCommand::kCmdLInsert:
+      return RedisListCommand::kCmdLInsert;
+    default:
+      break;
+  }
+
+  return RedisListCommand::kCmdNone;
 }
 
-rocksdb::Status TDigestMetadata::Decode(Slice *input) {
-  if (auto s = Metadata::Decode(input); !s.ok()) {
-    return s;
+RedisSetCommand GetSetCmdEqType(RedisSetCommand cmd_type) {
+  switch (cmd_type) {
+    case RedisSetCommand::kCmdSAdd:
+      return RedisSetCommand::kCmdSAdd;
+    case RedisSetCommand::kCmdSRem:
+      return RedisSetCommand::kCmdSRem;
+    case RedisSetCommand::kCmdSPop:
+      return RedisSetCommand::kCmdSPop;
+    default:
+      break;
   }
 
-  if (input->size() < (sizeof(uint32_t) * 2 + sizeof(uint64_t) * 6 + sizeof(double) * 2)) {
-    return rocksdb::Status::InvalidArgument(kErrMetadataTooShort);
-  }
-
-  GetFixed32(input, &compression);
-  GetFixed32(input, &capacity);
-  GetFixed64(input, &unmerged_nodes);
-  GetFixed64(input, &merged_nodes);
-  GetFixed64(input, &total_weight);
-  GetFixed64(input, &merged_weight);
-  GetDouble(input, &minimum);
-  GetDouble(input, &maximum);
-  GetFixed64(input, &total_observations);
-  GetFixed64(input, &merge_times);
-
-  return rocksdb::Status::OK();
+  return RedisSetCommand::kCmdNone;
 }
 
-void TimeSeriesMetadata::SetSourceKey(Slice key) { source_key = key.ToString(); }
+RedisZSetCommand GetZSetCmdEqType(RedisZSetCommand cmd_type) {
+  switch (cmd_type) {
+    case RedisZSetCommand::kCmdZAdd:
+      return RedisZSetCommand::kCmdZAdd;
+    case RedisZSetCommand::kCmdZRem:
+    case RedisZSetCommand::kCmdZRemRangeByRank:
+    case RedisZSetCommand::kCmdZRemRangeByScore:
+    case RedisZSetCommand::kCmdZPopMin:
+    case RedisZSetCommand::kCmdZPopMax:
+      return RedisZSetCommand::kCmdZRem;
 
-void TimeSeriesMetadata::Encode(std::string *dst) const {
-  Metadata::Encode(dst);
-  PutFixed64(dst, retention_time);
-  PutFixed64(dst, chunk_size);
-  PutFixed8(dst, static_cast<uint8_t>(chunk_type));
-  PutFixed8(dst, static_cast<uint8_t>(duplicate_policy));
-  PutSizedString(dst, source_key);
+    default:
+      break;
+  }
+
+  return RedisZSetCommand::kCmdNone;
 }
 
-rocksdb::Status TimeSeriesMetadata::Decode(Slice *input) {
-  if (auto s = Metadata::Decode(input); !s.ok()) {
-    return s;
-  }
-  if (input->size() < sizeof(uint64_t) * 2 + sizeof(uint8_t) * 2 + sizeof(uint32_t)) {
-    return rocksdb::Status::InvalidArgument(kErrMetadataTooShort);
+RedisBitmapCommand GetBitmapCmdEqType(RedisBitmapCommand cmd_type) {
+  // TODO: currently, bitmap cmds are not supported
+  return RedisBitmapCommand::kCmdNone;
+}
+
+RedisKeyCommand GetKeyCmdEqType(RedisKeyCommand cmd_type) {
+  switch (cmd_type) {
+    case RedisKeyCommand::kCmdExpire:
+    case RedisKeyCommand::kCmdExpireAt:
+    case RedisKeyCommand::kCmdPExpire:
+    case RedisKeyCommand::kCmdPExpireAt:
+      return RedisKeyCommand::kCmdPExpireAt;
+    case RedisKeyCommand::kCmdDel:
+    case RedisKeyCommand::kCmdUnlink:
+      return RedisKeyCommand::kCmdDel;
+    default:
+      break;
   }
 
-  GetFixed64(input, &retention_time);
-  GetFixed64(input, &chunk_size);
-  GetFixed8(input, reinterpret_cast<uint8_t *>(&chunk_type));
-  GetFixed8(input, reinterpret_cast<uint8_t *>(&duplicate_policy));
-  Slice source_key_slice;
-  GetSizedString(input, &source_key_slice);
-  source_key = source_key_slice.ToString();
-
-  return rocksdb::Status::OK();
+  return RedisKeyCommand::kCmdNone;
 }

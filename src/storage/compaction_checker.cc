@@ -20,37 +20,35 @@
 
 #include "compaction_checker.h"
 
-#include "logging.h"
+#include <glog/logging.h>
+
 #include "parse_util.h"
 #include "storage.h"
 #include "time_util.h"
 
-void CompactionChecker::CompactPropagateAndPubSubFiles() {
+void CompactionChecker::CompactFullCF(const std::string &cf_name) {
   rocksdb::CompactRangeOptions compact_opts;
-  // See https://github.com/facebook/rocksdb/issues/13671
-  // change_level doesn't work well with level_compaction_dynamic_level_bytes
-  compact_opts.change_level = !storage_->GetConfig()->rocks_db.level_compaction_dynamic_level_bytes;
-  for (const auto &cf :
-       {engine::ColumnFamilyConfigs::PubSubColumnFamily(), engine::ColumnFamilyConfigs::PropagateColumnFamily()}) {
-    info("[compaction checker] Start to compact the column family: {}", cf.Name());
-    auto cf_handle = storage_->GetCFHandle(cf.Id());
-    auto s = storage_->GetDB()->CompactRange(compact_opts, cf_handle, nullptr, nullptr);
-    info("[compaction checker] Compact the column family: {} finished, result: {}", cf.Name(), s.ToString());
-  }
+  compact_opts.change_level = true;
+  LOG(INFO) << "[compaction checker full] Start the compact the column family: " << cf_name;
+  auto cf_handle = storage_->GetCFHandle(cf_name);
+  auto s = storage_->GetDB()->CompactRange(compact_opts, cf_handle, nullptr, nullptr);
+  LOG(INFO) << "[compaction checker full] compact the column family: " << cf_name
+            << " finished, result: " << s.ToString();
 }
 
-void CompactionChecker::PickCompactionFilesForCf(const engine::ColumnFamilyConfig &column_family_config) {
+CompactResult CompactionChecker::PickCompactionFiles(const std::string &cf_name) {
+  CompactResult result;
   rocksdb::TablePropertiesCollection props;
-  rocksdb::ColumnFamilyHandle *cf = storage_->GetCFHandle(column_family_config.Id());
+  rocksdb::ColumnFamilyHandle *cf = storage_->GetCFHandle(cf_name);
   auto s = storage_->GetDB()->GetPropertiesOfAllTables(cf, &props);
   if (!s.ok()) {
-    warn("[compaction checker] Failed to get table properties, {}", s.ToString());
-    return;
+    LOG(WARNING) << "[compaction checker] Failed to get table properties, " << s.ToString();
+    return result;
   }
   // The main goal of compaction was reclaimed the disk space and removed
   // the tombstone. It seems that compaction checker was unnecessary here when
   // the live files was too few, Hard code to 1 here.
-  if (props.size() <= 1) return;
+  if (props.size() <= 1) return result;
 
   size_t max_files_to_compact = 1;
   if (props.size() / 360 > max_files_to_compact) {
@@ -64,10 +62,10 @@ void CompactionChecker::PickCompactionFilesForCf(const engine::ColumnFamilyConfi
 
   std::string best_filename;
   double best_delete_ratio = 0;
-  int64_t total_keys = 0, deleted_keys = 0;
+  uint64_t total_keys = 0, deleted_keys = 0, best_deleted_keys = 0;
   rocksdb::Slice start_key, stop_key, best_start_key, best_stop_key;
   for (const auto &iter : props) {
-    if (max_files_to_compact == 0) return;
+    if (max_files_to_compact == 0) return result;
 
     uint64_t file_creation_time = iter.second->file_creation_time;
     if (file_creation_time == 0) {
@@ -75,24 +73,27 @@ void CompactionChecker::PickCompactionFilesForCf(const engine::ColumnFamilyConfi
       // file_creation_time is 0 which means the unknown condition in rocksdb
       s = rocksdb::Env::Default()->GetFileModificationTime(iter.first, &file_creation_time);
       if (!s.ok()) {
-        info("[compaction checker] Failed to get the file creation time: {}, err: {}", iter.first, s.ToString());
+        LOG(INFO) << "[compaction checker] Failed to get the file creation time: " << iter.first
+                  << ", err: " << s.ToString();
         continue;
       }
     }
 
     for (const auto &property_iter : iter.second->user_collected_properties) {
       if (property_iter.first == "total_keys") {
-        auto parse_result = ParseInt<int>(property_iter.second, 10);
+        auto parse_result = ParseInt<uint64_t>(property_iter.second, 10);
         if (!parse_result) {
-          error("[compaction checker] Parse total_keys error: {}", parse_result.Msg());
+          LOG(ERROR) << "[compaction checker] Parse total_keys error: " << parse_result.Msg() << ", raw value: '"
+                     << property_iter.second << "'";
           continue;
         }
         total_keys = *parse_result;
       }
       if (property_iter.first == "deleted_keys") {
-        auto parse_result = ParseInt<int>(property_iter.second, 10);
+        auto parse_result = ParseInt<uint64_t>(property_iter.second, 10);
         if (!parse_result) {
-          error("[compaction checker] Parse deleted_keys error: {}", parse_result.Msg());
+          LOG(ERROR) << "[compaction checker] Parse deleted_keys error: " << parse_result.Msg() << ", raw value: '"
+                     << property_iter.second << "'";
           continue;
         }
         deleted_keys = *parse_result;
@@ -111,10 +112,17 @@ void CompactionChecker::PickCompactionFilesForCf(const engine::ColumnFamilyConfi
     // pick the file according to force compact policy
     if (file_creation_time < static_cast<uint64_t>(now - force_compact_file_age) &&
         delete_ratio >= force_compact_min_ratio) {
-      info("[compaction checker] Going to compact the key in file (force compact policy): {}", iter.first);
+      LOG(INFO) << "[compaction checker] Going to compact the key in file (force compact policy): " << iter.first;
+      // No filter for compact range to speed up the compaction job
+      storage_->GetConfig()->compact_with_filter_flag.store(false, std::memory_order_relaxed);
+      auto start_ms = util::GetTimeStampMS();
       auto s = storage_->Compact(cf, &start_key, &stop_key);
-      info("[compaction checker] Compact the key in file (force compact policy): {} finished, result: {}", iter.first,
-           s.ToString());
+      result.compact_range_spent_ms += util::GetTimeStampMS() - start_ms;
+      result.compact_range_times++;
+      result.compact_range_delete_tombs += deleted_keys;
+      storage_->GetConfig()->compact_with_filter_flag.store(true, std::memory_order_relaxed);
+      LOG(INFO) << "[compaction checker] Compact the key in file (force compact policy): " << iter.first
+                << " finished, result: " << s.ToString();
       max_files_to_compact--;
       continue;
     }
@@ -125,6 +133,7 @@ void CompactionChecker::PickCompactionFilesForCf(const engine::ColumnFamilyConfi
     // pick the file which has highest delete ratio
     if (total_keys != 0 && delete_ratio > best_delete_ratio) {
       best_delete_ratio = delete_ratio;
+      best_deleted_keys = deleted_keys;
       best_filename = iter.first;
       best_start_key = start_key;
       start_key.clear();
@@ -133,11 +142,19 @@ void CompactionChecker::PickCompactionFilesForCf(const engine::ColumnFamilyConfi
     }
   }
   if (best_delete_ratio > 0.1 && !best_start_key.empty() && !best_stop_key.empty()) {
-    info("[compaction checker] Going to compact the key in file: {}, delete ratio: {}", best_filename,
-         best_delete_ratio);
+    LOG(INFO) << "[compaction checker] Going to compact the key in file: " << best_filename
+              << ", delete ratio: " << best_delete_ratio;
+    // No filter to speed up the range compaction job
+    storage_->GetConfig()->compact_with_filter_flag.store(false, std::memory_order_relaxed);
+    auto start_ms = util::GetTimeStampMS();
     auto s = storage_->Compact(cf, &best_start_key, &best_stop_key);
+    result.compact_range_spent_ms += util::GetTimeStampMS() - start_ms;
+    result.compact_range_times++;
+    result.compact_range_delete_tombs += best_deleted_keys;
+    storage_->GetConfig()->compact_with_filter_flag.store(true, std::memory_order_relaxed);
     if (!s.ok()) {
-      error("[compaction checker] Failed to do compaction: {}", s.ToString());
+      LOG(ERROR) << "[compaction checker] Failed to do compaction: " << s.ToString();
     }
   }
+  return result;
 }

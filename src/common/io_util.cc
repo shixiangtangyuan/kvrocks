@@ -271,17 +271,20 @@ Status SockSendFileImpl(FD out_fd, int in_fd, size_t size, Args... args) {
 // please note that, the out socket fd should be in blocking mode.
 Status SockSendFile(int out_fd, int in_fd, size_t size) { return SockSendFileImpl<SendFileImpl>(out_fd, in_fd, size); }
 
-Status SockSendFile(int out_fd, int in_fd, size_t size, [[maybe_unused]] ssl_st *ssl) {
+Status SockSendFile(int out_fd, int in_fd, size_t size, ssl_st *ssl) {
 #ifdef ENABLE_OPENSSL
   if (ssl) {
-    // NOTE: SockSendFileImpl<SSL_sendfile> will cause errors, refer to #2756
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+    return SockSendFileImpl<SSL_sendfile>(ssl, in_fd, size, 0);
+#else
     return SockSendFileImpl<SendFileSSLImpl>(ssl, in_fd, size);
+#endif
   }
 #endif
   return SockSendFile(out_fd, in_fd, size);
 }
 
-Status SockSendFile(int out_fd, int in_fd, size_t size, [[maybe_unused]] bufferevent *bev) {
+Status SockSendFile(int out_fd, int in_fd, size_t size, bufferevent *bev) {
 #ifdef ENABLE_OPENSSL
   return SockSendFile(out_fd, in_fd, size, bufferevent_openssl_get_ssl(bev));
 #else
@@ -451,7 +454,7 @@ Status Write(int fd, const std::string &data) { return WriteImpl<write>(fd, data
 
 Status Pwrite(int fd, const std::string &data, off_t offset) { return WriteImpl<pwrite>(fd, data, offset); }
 
-Status SockSend(int fd, const std::string &data, [[maybe_unused]] ssl_st *ssl) {
+Status SockSend(int fd, const std::string &data, ssl_st *ssl) {
 #ifdef ENABLE_OPENSSL
   if (ssl) {
     return WriteImpl<SSL_write>(ssl, data);
@@ -460,7 +463,7 @@ Status SockSend(int fd, const std::string &data, [[maybe_unused]] ssl_st *ssl) {
   return SockSend(fd, data);
 }
 
-Status SockSend(int fd, const std::string &data, [[maybe_unused]] bufferevent *bev) {
+Status SockSend(int fd, const std::string &data, bufferevent *bev) {
 #ifdef ENABLE_OPENSSL
   return SockSend(fd, data, bufferevent_openssl_get_ssl(bev));
 #else
@@ -468,8 +471,7 @@ Status SockSend(int fd, const std::string &data, [[maybe_unused]] bufferevent *b
 #endif
 }
 
-StatusOr<int> SockConnect(const std::string &host, uint32_t port, [[maybe_unused]] ssl_st *ssl, int conn_timeout,
-                          int timeout) {
+StatusOr<int> SockConnect(const std::string &host, uint32_t port, ssl_st *ssl, int conn_timeout, int timeout) {
 #ifdef ENABLE_OPENSSL
   if (ssl) {
     auto fd = GET_OR_RET(SockConnect(host, port, conn_timeout, timeout));
@@ -489,7 +491,7 @@ StatusOr<int> SockConnect(const std::string &host, uint32_t port, [[maybe_unused
   return SockConnect(host, port, conn_timeout, timeout);
 }
 
-StatusOr<int> EvbufferRead(evbuffer *buf, evutil_socket_t fd, int howmuch, [[maybe_unused]] ssl_st *ssl) {
+StatusOr<int> EvbufferRead(evbuffer *buf, evutil_socket_t fd, int howmuch, ssl_st *ssl) {
 #ifdef ENABLE_OPENSSL
   if (ssl) {
     constexpr int BUFFER_SIZE = 4096;
@@ -499,12 +501,7 @@ StatusOr<int> EvbufferRead(evbuffer *buf, evutil_socket_t fd, int howmuch, [[may
       howmuch = BUFFER_SIZE;
     }
     if (howmuch = SSL_read(ssl, tmp, howmuch); howmuch <= 0) {
-      int err = SSL_get_error(ssl, howmuch);
-      if (err == SSL_ERROR_ZERO_RETURN) {
-        return {Status::EndOfFile, "EOF encountered while reading from SSL connection"};
-      }
-      return {(err == SSL_ERROR_WANT_READ) ? Status::TryAgain : Status::NotOK,
-              fmt::format("failed to read from SSL connection: {}", fmt::streamed(SSLError(howmuch)))};
+      return {Status::NotOK, fmt::format("failed to read from SSL connection: {}", fmt::streamed(SSLError(howmuch)))};
     }
 
     if (int ret = evbuffer_add(buf, tmp, howmuch); ret == -1) {
@@ -516,11 +513,8 @@ StatusOr<int> EvbufferRead(evbuffer *buf, evutil_socket_t fd, int howmuch, [[may
 #endif
   if (int ret = evbuffer_read(buf, fd, howmuch); ret > 0) {
     return ret;
-  } else if (ret == 0) {
-    return {Status::EndOfFile, "EOF encountered while reading from socket"};
   } else {
-    return {(errno == EWOULDBLOCK || errno == EAGAIN) ? Status::TryAgain : Status::NotOK,
-            fmt::format("failed to read from socket: {}", strerror(errno))};
+    return {Status::NotOK, fmt::format("failed to read from socket: {}", strerror(errno))};
   }
 }
 

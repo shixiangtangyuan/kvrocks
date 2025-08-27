@@ -28,37 +28,37 @@
 #include "storage/redis_db.h"
 #include "types/redis_hash.h"
 
-class TestFixture {  // NOLINT
- public:
-  TestFixture(TestFixture &&) = delete;
-  TestFixture(const TestFixture &) = delete;
-
+class TestBase : public ::testing::TestWithParam<bool> {  // NOLINT
  protected:
-  explicit TestFixture() {
+  explicit TestBase() : config_(new Config()), root_dir_("datanode-unittest.XXXXXX"), db_dir_("111") {
     const char *path = "test.conf";
     unlink(path);
     std::ofstream output_file(path, std::ios::out);
     output_file << "";
 
-    auto s = config_.Load(CLIOptions(path));
-    config_.db_dir = "testdb";
-    config_.rocks_db.compression = rocksdb::CompressionType::kNoCompression;
-    config_.rocks_db.write_buffer_size = 1;
-    config_.rocks_db.block_size = 100;
-    storage_ = std::make_unique<engine::Storage>(&config_);
-    s = storage_->Open();
+    if (!mkdtemp(root_dir_.data())) {
+      std::cerr << "Create root dir failed, pattern:" << root_dir_ << std::endl;
+      exit(1);
+    }
+    db_dir_ = root_dir_ + "/" + db_dir_;
+
+    auto s = config_->Load(CLIOptions(path));
+    config_->rocks_db.compression = rocksdb::CompressionType::kNoCompression;
+    config_->rocks_db.write_buffer_size = 1;
+    config_->rocks_db.block_size = 100;
+    storage_ = new engine::Storage(config_);
+    s = storage_->Open(db_dir_);
     if (!s.IsOK()) {
       std::cout << "Failed to open the storage, encounter error: " << s.Msg() << std::endl;
       assert(s.IsOK());
     }
-    ctx_ = std::make_unique<engine::Context>(storage_.get());
   }
-  ~TestFixture() {
-    ctx_.reset();
-    storage_.reset();
+  ~TestBase() override {
+    delete storage_;
+    delete config_;
 
     std::error_code ec;
-    std::filesystem::remove_all(config_.db_dir, ec);
+    std::filesystem::remove_all(root_dir_, ec);
     if (ec) {
       std::cout << "Encounter filesystem error: " << ec << std::endl;
     }
@@ -66,14 +66,12 @@ class TestFixture {  // NOLINT
     unlink(path);
   }
 
-  std::unique_ptr<engine::Storage> storage_;
-  Config config_;
+  engine::Storage *storage_;
+  Config *config_ = nullptr;
+  std::string root_dir_;
+  std::string db_dir_;
   std::string key_;
   std::vector<Slice> fields_;
   std::vector<Slice> values_;
-  std::unique_ptr<engine::Context> ctx_;
 };
-
-class TestBase : public TestFixture, public ::testing::Test {};
-
 #endif  // KVROCKS_TEST_BASE_H

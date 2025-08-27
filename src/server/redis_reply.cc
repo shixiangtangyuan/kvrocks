@@ -20,74 +20,30 @@
 
 #include "redis_reply.h"
 
-#include <map>
-#include <numeric>
+#include <sys/stat.h>
 
-const std::map<Status::Code, std::string> redisErrorPrefixMapping = {
-    {Status::RedisErrorNoPrefix, ""},          {Status::RedisNoProto, "NOPROTO"},
-    {Status::RedisLoading, "LOADING"},         {Status::RedisMasterDown, "MASTERDOWN"},
-    {Status::RedisNoScript, "NOSCRIPT"},       {Status::RedisNoAuth, "NOAUTH"},
-    {Status::RedisWrongType, "WRONGTYPE"},     {Status::RedisReadOnly, "READONLY"},
-    {Status::RedisExecAbort, "EXECABORT"},     {Status::RedisMoved, "MOVED"},
-    {Status::RedisCrossSlot, "CROSSSLOT"},     {Status::RedisTryAgain, "TRYAGAIN"},
-    {Status::RedisClusterDown, "CLUSTERDOWN"}, {Status::RedisNoGroup, "NOGROUP"},
-    {Status::RedisBusyGroup, "BUSYGROUP"}};
+#include <numeric>
+#include <sstream>
+
+#include "types/redis_hash.h"
 
 namespace redis {
 
-void Reply(evbuffer *output, const std::string &data) { evbuffer_add(output, data.c_str(), data.length()); }
+int Reply(evbuffer *output, const std::string &data) { return evbuffer_add(output, data.c_str(), data.length()); }
 
-std::string SimpleString(std::string_view data) {
-  std::string res;
-  res.reserve(data.size() + 3);  // 1 for '+', 2 for CRLF
-  res += RESP_PREFIX_SIMPLE_STRING;
-  res += data;
-  res += CRLF;
-  return res;
-}
+std::string SimpleString(const std::string &data) { return "+" + data + CRLF; }
 
-std::string Error(const Status &s) { return RESP_PREFIX_ERROR + StatusToRedisErrorMsg(s) + CRLF; }
+std::string Error(const std::string &err) { return "-" + err + CRLF; }
 
-std::string StatusToRedisErrorMsg(const Status &s) {
-  CHECK(!s.IsOK());
-  std::string prefix = "ERR";
-  if (auto it = redisErrorPrefixMapping.find(s.GetCode()); it != redisErrorPrefixMapping.end()) {
-    prefix = it->second;
-  }
-  if (prefix.empty()) {
-    return s.Msg();
-  }
-  return prefix + " " + s.Msg();
-}
+std::string BulkString(const std::string &data) { return "$" + std::to_string(data.length()) + CRLF + data + CRLF; }
 
-std::string BulkString(std::string_view data) {
-  std::string res = "$" + std::to_string(data.length()) + CRLF;
-  res.reserve(res.size() + data.size() + 2);
-  res += data;
-  res += CRLF;
-  return res;
-}
+std::string NilString() { return "$-1" CRLF; }
 
-std::string ArrayOfBulkStrings(const std::vector<std::string> &elems) {
-  std::string result = MultiLen(elems.size());
-  for (const auto &elem : elems) {
-    result += BulkString(elem);
-  }
-  return result;
-}
-
-std::string Bool(RESP ver, bool b) {
-  if (ver == RESP::v3) {
-    return b ? "#t" CRLF : "#f" CRLF;
-  }
-  return Integer(b ? 1 : 0);
-}
-
-std::string MultiBulkString(RESP ver, const std::vector<std::string> &values) {
-  std::string result = MultiLen(values.size());
+std::string MultiBulkString(const std::vector<std::string> &values, bool output_nil_for_empty_string) {
+  std::string result = "*" + std::to_string(values.size()) + CRLF;
   for (const auto &value : values) {
-    if (value.empty()) {
-      result += NilString(ver);
+    if (value.empty() && output_nil_for_empty_string) {
+      result += NilString();
     } else {
       result += BulkString(value);
     }
@@ -95,12 +51,17 @@ std::string MultiBulkString(RESP ver, const std::vector<std::string> &values) {
   return result;
 }
 
-std::string MultiBulkString(RESP ver, const std::vector<std::string> &values,
-                            const std::vector<rocksdb::Status> &statuses) {
-  std::string result = MultiLen(values.size());
+std::string MultiInteger(const std::vector<int64_t> &intergers) {
+  std::string result = "*" + std::to_string(intergers.size()) + CRLF;
+  for (const auto &i : intergers) result += Integer(i);
+  return result;
+}
+
+std::string MultiBulkString(const std::vector<std::string> &values, const std::vector<rocksdb::Status> &statuses) {
+  std::string result = "*" + std::to_string(values.size()) + CRLF;
   for (size_t i = 0; i < values.size(); i++) {
     if (i < statuses.size() && !statuses[i].ok()) {
-      result += NilString(ver);
+      result += NilString();
     } else {
       result += BulkString(values[i]);
     }
@@ -108,24 +69,22 @@ std::string MultiBulkString(RESP ver, const std::vector<std::string> &values,
   return result;
 }
 
-std::string SetOfBulkStrings(RESP ver, const std::vector<std::string> &elems) {
-  std::string result;
-  result += HeaderOfSet(ver, elems.size());
-  for (const auto &elem : elems) {
-    result += BulkString(elem);
-  }
+std::string Array(const std::vector<std::string> &list) {
+  size_t n = std::accumulate(list.begin(), list.end(), 0, [](size_t n, const std::string &s) { return n + s.size(); });
+  std::string result = "*" + std::to_string(list.size()) + CRLF;
+  std::string::size_type final_size = result.size() + n;
+  result.reserve(final_size);
+  for (const auto &i : list) result += i;
   return result;
 }
 
-std::string MapOfBulkStrings(RESP ver, const std::vector<std::string> &elems) {
-  CHECK(elems.size() % 2 == 0);
+std::string Command2RESP(const std::vector<std::string> &cmd_args) { return MultiBulkString(cmd_args, false); }
 
-  std::string result;
-  result += HeaderOfMap(ver, elems.size() / 2);
-  for (const auto &elem : elems) {
-    result += BulkString(elem);
-  }
-  return result;
+std::string KKVCASResp(const std::optional<std::string> &actual_value, bool flag) {
+  std::ostringstream os;
+  os << "*2" << CRLF << (flag ? ":1" : ":0") << CRLF;
+  os << (actual_value.has_value() ? BulkString(actual_value.value()) : NilString());
+  return os.str();
 }
 
 }  // namespace redis

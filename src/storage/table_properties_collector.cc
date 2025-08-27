@@ -53,6 +53,7 @@ rocksdb::Status CompactOnExpiredCollector::AddUserKey(const rocksdb::Slice &key,
   if (!s.ok()) return rocksdb::Status::OK();
 
   total_keys_ += metadata.size;
+  // TODO: Record deleted and expired keys respectively
   if (metadata.ExpireAt(Server::GetCachedUnixTime() * 1000)) {
     deleted_keys_ += metadata.size + 1;
   }
@@ -80,7 +81,7 @@ bool CompactOnExpiredCollector::NeedCompact() const {
 }
 
 rocksdb::TablePropertiesCollector *CompactOnExpiredTableCollectorFactory::CreateTablePropertiesCollector(
-    [[maybe_unused]] rocksdb::TablePropertiesCollectorFactory::Context context) {
+    rocksdb::TablePropertiesCollectorFactory::Context context) {
   return new CompactOnExpiredCollector(cf_name_, trigger_threshold_);
 }
 

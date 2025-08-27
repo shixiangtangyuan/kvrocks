@@ -21,6 +21,8 @@
 #include "log_collector.h"
 
 #include <algorithm>
+#include <iomanip>
+#include <iostream>
 #include <string>
 
 #include "server/redis_reply.h"
@@ -28,41 +30,66 @@
 
 std::string SlowEntry::ToRedisString() const {
   std::string output;
-  output.append(redis::MultiLen(6));
+  output.append(redis::MultiLen(9));
   output.append(redis::Integer(id));
   output.append(redis::Integer(time));
   output.append(redis::Integer(duration));
-  output.append(redis::ArrayOfBulkStrings(args));
+  output.append(redis::MultiBulkString(args));
   output.append(redis::BulkString(ip + ":" + std::to_string(port)));
   output.append(redis::BulkString(client_name));
+  output.append(redis::Integer(prepare_duration));
+  output.append(redis::Integer(command_queue_latency_on_connection));
+  output.append(redis::Integer(estimated_subkey_count));
   return output;
 }
 
-void SlowEntry::DumpToLogFile(spdlog::level::level_enum level) const {
-  if (level == spdlog::level::off) {
-    return;
-  }
-
-  std::string cmd;
-  if (args.size() > 0) {
-    for (const auto &arg : args) {
-      cmd.append(arg).append(" ");
+void OutputStringInHex(std::ostream &os, const std::string &str) {
+  std::ios_base::fmtflags flags(os.flags());
+  os << std::hex << std::setfill('0');
+  for (unsigned char c : str) {
+    if (c == '\\') {
+      os << "\\\\";
+    } else if (std::isprint(c)) {
+      os << c;
+    } else {
+      os << "\\x" << std::setw(2) << static_cast<unsigned int>(c);
     }
-    cmd.pop_back();
   }
-  log(level, "[slowlog] id: {}, timestamp: {}, duration: {}, cmd: {}, ip: {}, port: {}, client_name: {}", id, time,
-      duration, cmd, ip, port, client_name);
+  os.flags(flags);
+}
+
+std::ostream &operator<<(std::ostream &os, const SlowEntry &s) {
+  os << "req:";
+  if (!s.args.empty()) {
+    OutputStringInHex(os, s.args[0]);
+    for (size_t i = 1; i < s.args.size(); ++i) {
+      OutputStringInHex(os << ",", s.args[i]);
+    }
+  }
+  os << ", client:" << s.ip << ":" << s.port << ", duration:" << s.duration << "us";
+  if (s.prepare_duration >= 0) {
+    os << ", prepare_duration:" << s.prepare_duration << "us";
+  }
+  if (s.command_queue_latency_on_connection >= 0) {
+    os << ", command_queue_latency_on_connection:" << s.command_queue_latency_on_connection << "us";
+  }
+  if (s.estimated_subkey_count >= 0) {
+    os << ", estimated_subkey_count:" << s.estimated_subkey_count;
+  }
+  return os;
 }
 
 std::string PerfEntry::ToRedisString() const {
   std::string output;
-  output.append(redis::MultiLen(6));
+  output.append(redis::MultiLen(7));
   output.append(redis::Integer(id));
   output.append(redis::Integer(time));
   output.append(redis::BulkString(cmd_name));
   output.append(redis::Integer(duration));
   output.append(redis::BulkString(perf_context));
   output.append(redis::BulkString(iostats_context));
+  output.append(redis::Integer(prepare_duration));
+  output.append(redis::Integer(command_queue_latency_on_connection));
   return output;
 }
 
@@ -74,7 +101,8 @@ LogCollector<T>::~LogCollector() {
 template <class T>
 ssize_t LogCollector<T>::Size() {
   std::lock_guard<std::mutex> guard(mu_);
-  return static_cast<ssize_t>(entries_.size());
+  ssize_t n = entries_.size();
+  return n;
 }
 
 template <class T>
@@ -86,30 +114,24 @@ void LogCollector<T>::Reset() {
 }
 
 template <class T>
-void LogCollector<T>::SetMaxEntries(int64_t max_entries) {
+void LogCollector<T>::SetMaxEntries(uint64_t max_entries) {
   std::lock_guard<std::mutex> guard(mu_);
-  while (max_entries > 0 && static_cast<int64_t>(entries_.size()) > max_entries) {
+  while (entries_.size() > max_entries) {
     entries_.pop_back();
   }
-  max_entries_ = max_entries;
-}
-
-template <class T>
-void LogCollector<T>::SetDumpToLogfileLevel(spdlog::level::level_enum level) {
-  std::lock_guard<std::mutex> guard(mu_);
-  dump_to_logfile_level_ = level;
+  max_entries_.store(max_entries);
 }
 
 template <class T>
 void LogCollector<T>::PushEntry(std::unique_ptr<T> &&entry) {
+  if (max_entries_.load() <= 0) return;
   std::lock_guard<std::mutex> guard(mu_);
+  auto max_entries = max_entries_.load();
+  if (max_entries <= 0) return;
   entry->id = ++id_;
   entry->time = util::GetTimeStamp();
-  if (max_entries_ > 0 && !entries_.empty() && entries_.size() >= static_cast<size_t>(max_entries_)) {
+  while (!entries_.empty() && entries_.size() >= max_entries) {
     entries_.pop_back();
-  }
-  if (dump_to_logfile_level_ != spdlog::level::off) {
-    entry->DumpToLogFile(dump_to_logfile_level_);
   }
   entries_.push_front(std::move(entry));
 }

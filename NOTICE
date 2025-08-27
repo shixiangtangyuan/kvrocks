@@ -1,12 +1,8 @@
 Apache Kvrocks
-Copyright 2022-2025 The Apache Software Foundation
+Copyright 2022-2023 The Apache Software Foundation
 
 This product includes software developed at
 The Apache Software Foundation (http://www.apache.org/).
-
-================================================================
-
-Thanks to designers Lingyu Tian and Shili Fan for contributing the logo of Kvrocks.
 
 ================================================================
 
@@ -28,6 +24,7 @@ NB: RocksDB is dual-licensed under both the GPLv2 and Apache 2.0 License.
 This product uses it under the Apache 2.0 License.
 
 * oneTBB(https://github.com/oneapi-src/oneTBB)
+* speedb(https://github.com/speedb-io/speedb, alternative to rocksdb)
 
 Files src/common/rocksdb_crc32c.h and src/storage/batch_debugger.h are modified from RocksDB.
 Files src/types/bloom_filter.* are modified from Apache Arrow.
@@ -50,6 +47,7 @@ BSD-3-Clause licenses
 The following components are provided under the BSD-3-Clause License. See project link for details.
 The text of each license is also included in licenses/LICENSE-[project].txt.
 
+* glog(https://github.com/google/glog)
 * googletest(https://github.com/google/googletest)
 * libevent(https://github.com/libevent/libevent)
 * snappy(https://github.com/google/snappy)
@@ -67,10 +65,6 @@ The text of each license is also included in licenses/LICENSE-[project].txt
 * fmt(https://github.com/fmtlib/fmt)
 * LuaJIT(https://github.com/KvrocksLabs/LuaJIT)
 * lua(https://github.com/KvrocksLabs/lua, alternative to LuaJIT)
-* hat-trie(https://github.com/Tessil/hat-trie)
-* pegtl(https://github.com/taocpp/PEGTL, NOTE: changed to Boost Software License Version 1.0 in main branch)
-* cpptrace(https://github.com/jeremy-rifkin/cpptrace)
-* spdlog(https://github.com/gabime/spdlog)
 
 ================================================================
 Boost Software License Version 1.0
@@ -80,7 +74,6 @@ The text of each license is also included in licenses/LICENSE-[project].txt
 
 * jsoncons(https://github.com/danielaparker/jsoncons)
 * span-lite(https://github.com/martinmoene/span-lite)
-* range-v3(https://github.com/ericniebler/range-v3)
 
 ================================================================
 zlib/libpng licenses
@@ -88,7 +81,7 @@ zlib/libpng licenses
 The following components are provided under the zlib/libpng License. See project link for details.
 The text of each license is also included in licenses/LICENSE-[project].txt
 
-* zlib-ng(https://github.com/zlib-ng/zlib-ng)
+* zlib(https://github.com/madler/zlib)
 
 ================================================================
 Public Domain

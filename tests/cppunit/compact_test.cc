@@ -19,24 +19,26 @@
  */
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
+#include <cassert>
 #include <cstdint>
 #include <filesystem>
+#include <vector>
 
-#include "search/index_info.h"
-#include "search/indexer.h"
 #include "storage/redis_metadata.h"
 #include "storage/storage.h"
+#include "time_util.h"
 #include "types/redis_hash.h"
 #include "types/redis_zset.h"
 
 TEST(Compact, Filter) {
   Config config;
-  config.db_dir = "compactdb";
+  std::string db_dir = "compactdb";
   config.slot_id_encoded = false;
 
   auto storage = std::make_unique<engine::Storage>(&config);
-  Status s = storage->Open();
+  Status s = storage->Open(db_dir);
   assert(s.IsOK());
 
   uint64_t ret = 0;
@@ -44,19 +46,17 @@ TEST(Compact, Filter) {
   auto hash = std::make_unique<redis::Hash>(storage.get(), ns);
   std::string expired_hash_key = "expire_hash_key";
   std::string live_hash_key = "live_hash_key";
-
-  engine::Context ctx(storage.get());
-
-  hash->Set(ctx, expired_hash_key, "f1", "v1", &ret);
-  hash->Set(ctx, expired_hash_key, "f2", "v2", &ret);
-  auto st = hash->Expire(ctx, expired_hash_key, 1);  // expired
+  hash->Set(expired_hash_key, "f1", "v1", &ret);
+  hash->Set(expired_hash_key, "f2", "v2", &ret);
+  auto st = hash->Expire(expired_hash_key, 1);  // expired
   usleep(10000);
-  hash->Set(ctx, live_hash_key, "f1", "v1", &ret);
-  hash->Set(ctx, live_hash_key, "f2", "v2", &ret);
+  hash->Set(live_hash_key, "f1", "v1", &ret);
+  hash->Set(live_hash_key, "f2", "v2", &ret);
 
   auto status = storage->Compact(nullptr, nullptr, nullptr);
   assert(status.ok());
   // Compact twice to workaround issue fixed by: https://github.com/facebook/rocksdb/pull/11468
+  // before rocksdb/speedb 8.1.1. This line can be removed after speedb upgraded above 8.1.1.
   status = storage->Compact(nullptr, nullptr, nullptr);
   assert(status.ok());
 
@@ -65,57 +65,62 @@ TEST(Compact, Filter) {
   read_options.snapshot = db->GetSnapshot();
   read_options.fill_cache = false;
 
-  auto new_iterator = [db, read_options, &storage](ColumnFamilyID column_family_id) {
-    return std::unique_ptr<rocksdb::Iterator>(db->NewIterator(read_options, storage->GetCFHandle(column_family_id)));
+  auto new_iterator = [db, read_options, &storage](const std::string& name) {
+    return std::unique_ptr<rocksdb::Iterator>(db->NewIterator(read_options, storage->GetCFHandle(name)));
   };
-
-  auto iter = new_iterator(ColumnFamilyID::Metadata);
+  auto iter = new_iterator("metadata");
+  int64_t count = 0;
   for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+    count++;
     auto [user_ns, user_key] = ExtractNamespaceKey(iter->key(), storage->IsSlotIdEncoded());
     EXPECT_EQ(user_key.ToString(), live_hash_key);
   }
+  EXPECT_EQ(count, 1);
 
-  iter = new_iterator(ColumnFamilyID::PrimarySubkey);
+  iter = new_iterator("subkey");
+  count = 0;
   for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+    count++;
     InternalKey ikey(iter->key(), storage->IsSlotIdEncoded());
     EXPECT_EQ(ikey.GetKey().ToString(), live_hash_key);
   }
+  EXPECT_EQ(count, 2);
 
   auto zset = std::make_unique<redis::ZSet>(storage.get(), ns);
   std::string expired_zset_key = "expire_zset_key";
   std::vector<MemberScore> member_scores = {MemberScore{"z1", 1.1}, MemberScore{"z2", 0.4}};
-  zset->Add(ctx, expired_zset_key, ZAddFlags::Default(), &member_scores, &ret);
-  st = zset->Expire(ctx, expired_zset_key, 1);  // expired
+  zset->Add(expired_zset_key, ZAddFlags::Default(), &member_scores, &ret);
+  st = zset->Expire(expired_zset_key, 1);  // expired
   usleep(10000);
 
   // Same as the above compact, need to compact twice here
   status = storage->Compact(nullptr, nullptr, nullptr);
-  EXPECT_TRUE(status.ok());
+  assert(status.ok());
   status = storage->Compact(nullptr, nullptr, nullptr);
-  EXPECT_TRUE(status.ok());
+  assert(status.ok());
 
-  iter = new_iterator(ColumnFamilyID::PrimarySubkey);
+  iter = new_iterator("default");
   for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
     InternalKey ikey(iter->key(), storage->IsSlotIdEncoded());
     EXPECT_EQ(ikey.GetKey().ToString(), live_hash_key);
   }
 
-  iter = new_iterator(ColumnFamilyID::SecondarySubkey);
+  iter = new_iterator("zset_score");
   for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
     EXPECT_TRUE(false);  // never reach here
   }
 
   Slice mk_with_ttl = "mk_with_ttl";
-  hash->Set(ctx, mk_with_ttl, "f1", "v1", &ret);
-  hash->Set(ctx, mk_with_ttl, "f2", "v2", &ret);
+  hash->Set(mk_with_ttl, "f1", "v1", &ret);
+  hash->Set(mk_with_ttl, "f2", "v2", &ret);
 
   int retry = 2;
   while (retry-- > 0) {
     status = storage->Compact(nullptr, nullptr, nullptr);
-    ASSERT_TRUE(status.ok());
+    assert(status.ok());
     std::vector<FieldValue> fieldvalues;
-    auto get_res = hash->GetAll(ctx, mk_with_ttl, &fieldvalues);
-    auto s_expire = hash->Expire(ctx, mk_with_ttl, 1);  // expired immediately..
+    auto get_res = hash->GetAll(mk_with_ttl, &fieldvalues);
+    auto s_expire = hash->Expire(mk_with_ttl, 1);  // expired immediately..
 
     if (retry == 1) {
       ASSERT_TRUE(get_res.ok());  // not expired first time
@@ -130,77 +135,92 @@ TEST(Compact, Filter) {
 
   db->ReleaseSnapshot(read_options.snapshot);
   std::error_code ec;
-  std::filesystem::remove_all(config.db_dir, ec);
+  std::filesystem::remove_all(db_dir, ec);
   if (ec) {
     std::cout << "Encounter filesystem error: " << ec << std::endl;
   }
 }
 
-TEST(Compact, SearchFilter) {
+TEST(Compact, HTTLCompaction) {
   Config config;
-  config.db_dir = "compactdb";
+  encode_hash_sub_flag.store(true);
+  std::string db_dir = "compactdb";
+  // clear db dir
+  std::error_code ec;
+  std::filesystem::remove_all(db_dir, ec);
+  if (ec) {
+    std::cout << "Encounter filesystem error: " << ec << std::endl;
+  }
+
   config.slot_id_encoded = false;
 
   auto storage = std::make_unique<engine::Storage>(&config);
-  auto s = storage->Open();
+  Status s = storage->Open(db_dir);
   assert(s.IsOK());
 
   uint64_t ret = 0;
-  std::string ns = "test_compact_search";
+  std::string ns = "test_compact";
   auto hash = std::make_unique<redis::Hash>(storage.get(), ns);
+  encode_hash_sub_flag.store(true);
+  std::string expired_hash_key = "expire_hash_key";
+  std::string sub_ttl_expierd_hash_key = "sub_ttl_expierd_hash_key";
+  std::string sub_ttl_lived_hash_key = "sub_ttl_lived_hash_key";
+  hash->Set(expired_hash_key, "f1", "v1", &ret);
+  hash->Set(expired_hash_key, "f2", "v2", &ret);
+  auto st = hash->Expire(expired_hash_key, 1);  // expired
+  EXPECT_TRUE(st.ok());
+  // Set sub ttl field
+  std::vector<Slice> fields = {"f1", "f2"};
+  std::vector<SetExRes> ttl_ret;
+  hash->Set(sub_ttl_expierd_hash_key, "f1", "v1", &ret);
+  hash->Set(sub_ttl_expierd_hash_key, "f2", "v2", &ret);
+  st = hash->HExpireAt(sub_ttl_expierd_hash_key, fields, util::GetTimeStampMS() + 2, ttl_ret);
+  EXPECT_TRUE(st.ok());
+  EXPECT_TRUE(ttl_ret[0] == 1);
+  EXPECT_TRUE(ttl_ret[1] == 1);
+  hash->Set(sub_ttl_lived_hash_key, "f1", "v1", &ret);
+  hash->Set(sub_ttl_lived_hash_key, "f2", "v2", &ret);
+  fields = {"f1"};
+  ttl_ret.clear();
+  st = hash->HExpireAt(sub_ttl_lived_hash_key, fields, util::GetTimeStampMS() + 2, ttl_ret);
+  EXPECT_TRUE(st.ok());
+  EXPECT_TRUE(ttl_ret[0] == 1);
+  usleep(100000);
+  auto status = storage->Compact(nullptr, nullptr, nullptr);
+  assert(status.ok());
+  // Compact twice to workaround issue fixed by: https://github.com/facebook/rocksdb/pull/11468
+  // before rocksdb/speedb 8.1.1. This line can be removed after speedb upgraded above 8.1.1.
+  status = storage->Compact(nullptr, nullptr, nullptr);
+  assert(status.ok());
 
-  redis::IndexMetadata hash_field_meta;
-  hash_field_meta.on_data_type = redis::IndexOnDataType::HASH;
+  rocksdb::DB* db = storage->GetDB();
+  rocksdb::ReadOptions read_options;
+  read_options.snapshot = db->GetSnapshot();
+  read_options.fill_cache = false;
 
-  auto hash_info = std::make_unique<kqir::IndexInfo>("hashtest", hash_field_meta, ns);
-  hash_info->Add(kqir::FieldInfo("f1", std::make_unique<redis::TagFieldMetadata>()));
-  hash_info->Add(kqir::FieldInfo("f2", std::make_unique<redis::NumericFieldMetadata>()));
+  auto new_iterator = [db, read_options, &storage](const std::string& name) {
+    return std::unique_ptr<rocksdb::Iterator>(db->NewIterator(read_options, storage->GetCFHandle(name)));
+  };
 
-  redis::GlobalIndexer indexer(storage.get());
-  kqir::IndexMap map;
-  map.Insert(std::move(hash_info));
+  auto iter = new_iterator("metadata");
+  iter->SeekToFirst();
+  EXPECT_TRUE(iter->Valid());
+  auto [user_ns, user_key] = ExtractNamespaceKey(iter->key(), storage->IsSlotIdEncoded());
+  EXPECT_EQ(user_key.ToString(), sub_ttl_lived_hash_key);
+  iter->Next();
+  EXPECT_TRUE(!iter->Valid());
 
-  auto hash_updater = std::make_unique<redis::IndexUpdater>(map.at(ComposeNamespaceKey(ns, "hashtest", false)).get());
-  indexer.Add(std::move(hash_updater));
+  iter = new_iterator("subkey");
+  iter->SeekToFirst();
+  EXPECT_TRUE(iter->Valid());
+  InternalKey ikey(iter->key(), storage->IsSlotIdEncoded());
+  EXPECT_EQ(ikey.GetKey().ToString(), sub_ttl_lived_hash_key);
+  iter->Next();
+  EXPECT_TRUE(!iter->Valid());
 
-  engine::Context ctx(storage.get());
-  std::string hash_key = "hash_key";
+  db->ReleaseSnapshot(read_options.snapshot);
 
-  auto sr = indexer.Record(ctx, hash_key, ns);
-  ASSERT_EQ(sr.Msg(), Status::ok_msg);
-  auto record = *sr;
-
-  hash->Set(ctx, hash_key, "f1", "hello", &ret);
-  hash->Set(ctx, hash_key, "f2", "233", &ret);
-
-  auto su = indexer.Update(ctx, record);
-  ASSERT_TRUE(su);
-
-  auto tag_search_key = redis::SearchKey(ns, "hashtest", "f1").ConstructTagFieldData("hello", hash_key);
-  std::string search_value;
-  auto sg = storage->Get(ctx, rocksdb::ReadOptions(), storage->GetCFHandle(ColumnFamilyID::Search), tag_search_key,
-                         &search_value);
-  ASSERT_TRUE(sg.ok());
-
-  auto num_search_key = redis::SearchKey(ns, "hashtest", "f2").ConstructNumericFieldData(233, hash_key);
-  sg = storage->Get(ctx, rocksdb::ReadOptions(), storage->GetCFHandle(ColumnFamilyID::Search), num_search_key,
-                    &search_value);
-  ASSERT_TRUE(sg.ok());
-
-  auto st = hash->Expire(ctx, hash_key, 1);
-
-  ASSERT_TRUE(storage->Compact(nullptr, nullptr, nullptr).ok());
-
-  sg = storage->Get(ctx, rocksdb::ReadOptions(), storage->GetCFHandle(ColumnFamilyID::Search), tag_search_key,
-                    &search_value);
-  ASSERT_TRUE(sg.IsNotFound());
-
-  sg = storage->Get(ctx, rocksdb::ReadOptions(), storage->GetCFHandle(ColumnFamilyID::Search), num_search_key,
-                    &search_value);
-  ASSERT_TRUE(sg.IsNotFound());
-
-  std::error_code ec;
-  std::filesystem::remove_all(config.db_dir, ec);
+  std::filesystem::remove_all(db_dir, ec);
   if (ec) {
     std::cout << "Encounter filesystem error: " << ec << std::endl;
   }

@@ -29,14 +29,17 @@
 #include <utility>
 #include <vector>
 
+#include "cluster/cluster.h"
 #include "commands/commander.h"
-#include "event_util.h"
+#include "common/event_util.h"
+#include "lock/lock.h"
 #include "redis_request.h"
-#include "server/redis_reply.h"
 
 class Worker;
 
 namespace redis {
+
+class SlotRange;
 
 class Connection : public EvbufCallbackBase<Connection> {
  public:
@@ -46,14 +49,7 @@ class Connection : public EvbufCallbackBase<Connection> {
     kCloseAfterReply = 1 << 6,
     kCloseAsync = 1 << 7,
     kMultiExec = 1 << 8,
-    kReadOnly = 1 << 9,
-    kAsking = 1 << 10,
-  };
-
-  enum class ReplyMode {
-    ON,   // Always reply to every command (default)
-    OFF,  // Never reply to any command
-    SKIP  // Skip reply for the next command, then automatically switch back to ON
+    kReadDisabled = 1 << 9,
   };
 
   explicit Connection(bufferevent *bev, Worker *owner);
@@ -67,49 +63,12 @@ class Connection : public EvbufCallbackBase<Connection> {
   void OnRead(bufferevent *bev);
   void OnWrite(bufferevent *bev);
   void OnEvent(bufferevent *bev, int16_t events);
+  void Reply(const std::string &msg);
+  inline void RecordFailAndReply(const std::string &msg, GlobalStats::RequestResult type);
+  inline void RecordFailAndReplyWithCmd(const std::string &msg, GlobalStats::RequestResult type,
+                                        const std::string &cmd_name);
   void SendFile(int fd);
   std::string ToString();
-
-  void Reply(const std::string &msg);
-  const std::vector<std::string> &GetQueuedReplies() const;
-  void ClearQueuedReplies() { queued_replies_.clear(); }
-  RESP GetProtocolVersion() const { return protocol_version_; }
-  void SetProtocolVersion(RESP version) { protocol_version_ = version; }
-  std::string Bool(bool b) const { return redis::Bool(protocol_version_, b); }
-  std::string BigNumber(const std::string &n) const { return redis::BigNumber(protocol_version_, n); }
-  std::string Double(double d) const { return redis::Double(protocol_version_, d); }
-  std::string VerbatimString(std::string ext, const std::string &data) const {
-    return redis::VerbatimString(protocol_version_, std::move(ext), data);
-  }
-  std::string NilString() const { return redis::NilString(protocol_version_); }
-  std::string NilArray() const { return redis::NilArray(protocol_version_); }
-  std::string MultiBulkString(const std::vector<std::string> &values) const {
-    return redis::MultiBulkString(protocol_version_, values);
-  }
-  std::string MultiBulkString(const std::vector<std::string> &values,
-                              const std::vector<rocksdb::Status> &statuses) const {
-    return redis::MultiBulkString(protocol_version_, values, statuses);
-  }
-  template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
-  std::string HeaderOfSet(T len) const {
-    return redis::HeaderOfSet(protocol_version_, len);
-  }
-  std::string SetOfBulkStrings(const std::vector<std::string> &elems) const {
-    return redis::SetOfBulkStrings(protocol_version_, elems);
-  }
-  template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
-  std::string HeaderOfMap(T len) const {
-    return redis::HeaderOfMap(protocol_version_, len);
-  }
-  std::string MapOfBulkStrings(const std::vector<std::string> &elems) const {
-    return redis::MapOfBulkStrings(protocol_version_, elems);
-  }
-  std::string Map(const std::map<std::string, std::string> &map) const { return redis::Map(protocol_version_, map); }
-  template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
-  std::string HeaderOfAttribute(T len) const {
-    return redis::HeaderOfAttribute(len);
-  }
-  std::string HeaderOfPush(int64_t len) const { return redis::HeaderOfPush(protocol_version_, len); }
 
   using UnsubscribeCallback = std::function<void(std::string, int)>;
   void SubscribeChannel(const std::string &channel);
@@ -120,14 +79,10 @@ class Connection : public EvbufCallbackBase<Connection> {
   void PUnsubscribeChannel(const std::string &pattern);
   void PUnsubscribeAll(const UnsubscribeCallback &reply = nullptr);
   int PSubscriptionsCount();
-  void SSubscribeChannel(const std::string &channel, uint16_t slot);
-  void SUnsubscribeChannel(const std::string &channel, uint16_t slot);
-  void SUnsubscribeAll(const UnsubscribeCallback &reply = nullptr);
-  int SSubscriptionsCount();
 
   uint64_t GetAge() const;
   uint64_t GetIdleTime() const;
-  void SetLastInteraction();
+  inline void SetLastInteraction() { last_interaction_ = util::GetTimeStamp(); }
   std::string GetFlags() const;
   void EnableFlag(Flag flag);
   void DisableFlag(Flag flag);
@@ -167,11 +122,11 @@ class Connection : public EvbufCallbackBase<Connection> {
   evbuffer *Input() { return bufferevent_get_input(bev_); }
   evbuffer *Output() { return bufferevent_get_output(bev_); }
   bufferevent *GetBufferEvent() { return bev_; }
-  void ExecuteCommands(std::deque<CommandTokens> *to_process_cmds);
-  Status ExecuteCommand(engine::Context &ctx, const std::string &cmd_name, const std::vector<std::string> &cmd_tokens,
-                        Commander *current_cmd, std::string *reply);
+  void ExecuteCommands();
   bool IsProfilingEnabled(const std::string &cmd);
-  void RecordProfilingSampleIfNeed(const std::string &cmd, uint64_t duration);
+  void RecordProfilingSampleIfNeed(const std::string &cmd, uint64_t duration,
+                                   std::optional<std::pair<std::string, std::string>> &&perf_io_context,
+                                   int64_t prepare_duration = -1, int64_t command_queue_latency_on_connection = -1);
   void SetImporting() { importing_ = true; }
   bool IsImporting() const { return importing_; }
   bool CanMigrate() const;
@@ -179,19 +134,39 @@ class Connection : public EvbufCallbackBase<Connection> {
   // Multi exec
   void SetInExec() { in_exec_ = true; }
   bool IsInExec() const { return in_exec_; }
-  bool IsInScript() const { return in_script_; }
   bool IsMultiError() const { return multi_error_; }
   void ResetMultiExec();
   std::deque<redis::CommandTokens> *GetMultiExecCommands() { return &multi_cmds_; }
+
+  Status CheckKeysInSameSlot(const CommandAttributes *attr, const CommandTokens &cmd_token);
+  Status HandleCmdScript(Context *ctx, std::vector<std::unique_ptr<SlotRangeLock>> *sr_locks);
+  StatusOr<std::shared_ptr<engine::Storage>> HandleCmdNodeScan(uint64_t cmd_flags,
+                                                               const std::unique_ptr<Commander> &cmd, Context *ctx,
+                                                               std::vector<std::unique_ptr<SlotRangeLock>> *sr_locks);
+
+  std::deque<CommandTokens> *GetCommandsPtr() { return &to_process_cmds_; }
+  bool IsBlocked() { return is_blocked_; }
+  void SetUnblocked();
 
   std::function<void(int)> close_cb = nullptr;
 
   std::set<std::string> watched_keys;
   std::atomic<bool> watched_keys_modified = false;
 
-  // Reply mode getter/setter
-  void SetReplyMode(ReplyMode mode) { reply_mode_ = mode; }
-  ReplyMode GetReplyMode() const { return reply_mode_; }
+ private:
+  Status getExecLocks(uint64_t cmd_flags, const std::string &slot_range_name, const CommandAttributes *attr,
+                      const CommandTokens &cmd_token, Context *ctx, std::vector<std::unique_ptr<KeyLock>> *key_locks,
+                      std::vector<std::unique_ptr<SlotRangeLock>> *sr_locks);
+
+  Status lockAllSlotRanges(Context *ctx, mgl::LockMode mode, std::vector<std::unique_ptr<SlotRangeLock>> *sr_locks);
+
+  bool hasBufferExceedLimit(size_t msg_size);
+
+  bool disableReadEvent();
+
+  bool reply(const std::string &msg);
+
+  FRIEND_TEST(ConnectionTest, TestLocks);
 
  private:
   uint64_t id_ = 0;
@@ -208,6 +183,7 @@ class Connection : public EvbufCallbackBase<Connection> {
   std::string last_cmd_;
   int64_t create_time_;
   int64_t last_interaction_;
+  std::chrono::steady_clock::time_point start_processing_time_;
 
   bufferevent *bev_;
   Request req_;
@@ -216,20 +192,17 @@ class Connection : public EvbufCallbackBase<Connection> {
 
   std::vector<std::string> subscribe_channels_;
   std::vector<std::string> subscribe_patterns_;
-  std::vector<std::string> subscribe_shard_channels_;
 
   Server *srv_;
   bool in_exec_ = false;
   bool multi_error_ = false;
   std::atomic<bool> is_running_ = false;
   std::deque<redis::CommandTokens> multi_cmds_;
-  bool in_script_ = false;
 
   bool importing_ = false;
-  RESP protocol_version_ = RESP::v2;
 
-  ReplyMode reply_mode_ = ReplyMode::ON;
-  std::vector<std::string> queued_replies_;
+  bool is_blocked_ = false;
+  std::deque<CommandTokens> to_process_cmds_;
 };
 
 }  // namespace redis

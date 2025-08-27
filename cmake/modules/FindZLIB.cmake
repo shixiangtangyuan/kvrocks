@@ -22,7 +22,8 @@ if(zlib_SOURCE_DIR)
 
   add_library(zlib_with_headers INTERFACE) # rocksdb use it
   target_include_directories(zlib_with_headers INTERFACE $<BUILD_INTERFACE:${zlib_SOURCE_DIR}> $<BUILD_INTERFACE:${zlib_BINARY_DIR}>)
-  target_link_libraries(zlib_with_headers INTERFACE zlib)
+  target_link_libraries(zlib_with_headers INTERFACE zlibstatic)
   add_library(ZLIB::ZLIB ALIAS zlib_with_headers)
-  install(TARGETS zlib zlib_with_headers EXPORT RocksDBTargets) # export for install(...)
+  install(TARGETS zlibstatic zlib_with_headers EXPORT RocksDBTargets) # export for install(...)
+  install(TARGETS zlibstatic zlib_with_headers EXPORT SpeedbTargets) # export for install(...)
 endif()

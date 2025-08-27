@@ -30,14 +30,32 @@
 #include "config/config_util.h"
 #include "server/server.h"
 
+void SetDatanodeConfItems(const char *path) {
+  std::ofstream output_file(path, std::ios::app);
+  output_file << "datadir-list test_datadirlist"
+              << "\n"
+              << "cluster-id test_clusterid"
+              << "\n"
+              << "datanode-id tset_datanodeid"
+              << "\n"
+              << "controller-addr test_addr "
+              << "\n"
+              << "pool test_pool"
+              << "\n";
+  output_file.close();
+}
+
 TEST(Config, GetAndSet) {
   const char *path = "test.conf";
   Config config;
 
   auto s = config.Load(CLIOptions(path));
   EXPECT_FALSE(s.IsOK());
+
   std::map<std::string, std::string> mutable_cases = {
-      {"workers", "4"},
+      // this option will change the workers size without lock protection.
+      // It may result in concurrent issue.
+      // {"workers", "4"},
       {"log-level", "info"},
       {"timeout", "1000"},
       {"maxclients", "2000"},
@@ -45,30 +63,25 @@ TEST(Config, GetAndSet) {
       {"max-backup-keep-hours", "4000"},
       {"requirepass", "mytest_requirepass"},
       {"masterauth", "mytest_masterauth"},
-      {"compact-cron", "1 2 3 4 5"},
-      {"bgsave-cron", "5 4 3 2 1"},
-      {"dbsize-scan-cron", "1 2 3 2 1"},
       {"max-io-mb", "5000"},
       {"max-db-size", "6000"},
       {"max-replication-mb", "7000"},
       {"slave-serve-stale-data", "no"},
       {"slave-read-only", "no"},
       {"slave-priority", "101"},
-      {"slowlog-log-slower-than", "1234"},
-      {"slowlog-max-len", "123"},
+      {"slow-req-record-threshold-us", "1234"},
+      {"slow-req-record-max-len", "123"},
+      {"slow-req-log-threshold-us", "2345"},
+      {"slow-req-log-period-us", "234"},
       {"profiling-sample-ratio", "50"},
       {"profiling-sample-record-max-len", "1"},
-      {"profiling-sample-record-threshold-ms", "50"},
+      {"profiling-sample-record-threshold-us", "50"},
       {"profiling-sample-commands", "get,set"},
-      {"backup-dir", "test_dir/backup"},
-
       {"rocksdb.compression", "no"},
       {"rocksdb.max_open_files", "1234"},
       {"rocksdb.write_buffer_size", "1234"},
       {"rocksdb.max_write_buffer_number", "1"},
-      {"rocksdb.min_write_buffer_number_to_merge", "1"},
       {"rocksdb.target_file_size_base", "100"},
-      {"rocksdb.max_background_compactions", "-1"},
       {"rocksdb.max_subcompactions", "3"},
       {"rocksdb.delayed_write_rate", "1234"},
       {"rocksdb.stats_dump_period_sec", "600"},
@@ -80,24 +93,50 @@ TEST(Config, GetAndSet) {
       {"rocksdb.blob_file_size", "268435456"},
       {"rocksdb.enable_blob_garbage_collection", "yes"},
       {"rocksdb.blob_garbage_collection_age_cutoff", "25"},
+      {"rocksdb.blob_garbage_collection_force_threshold", "75"},
       {"rocksdb.max_bytes_for_level_base", "268435456"},
       {"rocksdb.max_bytes_for_level_multiplier", "10"},
       {"rocksdb.level_compaction_dynamic_level_bytes", "yes"},
       {"rocksdb.max_background_jobs", "4"},
-      {"rocksdb.compression_start_level", "2"},
-      {"rocksdb.sst_file_delete_rate_bytes_per_sec", "0"},
-  };
+      {"rocksdb.target_file_size_multiplier", "4096"},
+      {"rocksdb.arena_block_size", "4096"},
+      {"rocksdb.soft_pending_compaction_bytes_limit", "26843545600"},
+      {"rocksdb.hard_pending_compaction_bytes_limit", "268435456000"},
+      {"rocksdb.max_compaction_bytes", "26843545600"},
+      {"rocksdb.max_sequential_skip_in_iterations", "8"},
+      {"rocksdb.paranoid_file_checks", "yes"},
+      {"rocksdb.report_bg_io_stats", "yes"},
+      {"rocksdb.sample_for_compression", "16"},
+      {"rocksdb.delete_obsolete_files_period_micros", "28800"},
+      {"rocksdb.writable_file_max_buffer_size", "8192"},
+      {"rocksdb.bytes_per_sync", "16"},
+      {"rocksdb.wal_bytes_per_sync", "16"},
+      {"rocksdb.avoid_flush_during_shutdown", "yes"},
+      {"rocksdb.stats_persist_period_sec", "3600"},
+      {"rocksdb.stats_history_buffer_size", "4096"},
+      {"rocksdb.bottommost_file_compaction_delay", "1"},
+      {"rocksdb.periodic_compaction_seconds", "2592001"},
+      {"rocksdb.ttl", "2592001"}};
   std::vector<std::string> values;
   for (const auto &iter : mutable_cases) {
     s = config.Set(nullptr, iter.first, iter.second);
-    ASSERT_TRUE(s.IsOK());
+    ASSERT_TRUE(s.IsOK()) << "key:" << iter.first << ", value:" << iter.second;
     config.Get(iter.first, &values);
     ASSERT_TRUE(s.IsOK());
     ASSERT_EQ(values.size(), 2);
     EXPECT_EQ(values[0], iter.first);
+    if (iter.first == "rocksdb.max_write_buffer_number") {
+      auto ret = ParseInt(iter.second);
+      ASSERT_TRUE(ret.IsOK());
+      if (auto num = ret.GetValue(); num <= kMinWriteBufferNumberToMerge) {
+        EXPECT_EQ(values[1], std::to_string(kMinWriteBufferNumberToMerge + 1));
+        continue;
+      }
+    }
     EXPECT_EQ(values[1], iter.second);
   }
   ASSERT_TRUE(config.Rewrite({}).IsOK());
+  SetDatanodeConfItems(path);
   s = config.Load(CLIOptions(path));
   EXPECT_TRUE(s.IsOK());
   for (const auto &iter : mutable_cases) {
@@ -106,6 +145,14 @@ TEST(Config, GetAndSet) {
     config.Get(iter.first, &values);
     ASSERT_EQ(values.size(), 2);
     EXPECT_EQ(values[0], iter.first);
+    if (iter.first == "rocksdb.max_write_buffer_number") {
+      auto ret = ParseInt(iter.second);
+      ASSERT_TRUE(ret.IsOK());
+      if (auto num = ret.GetValue(); num <= kMinWriteBufferNumberToMerge) {
+        EXPECT_EQ(values[1], std::to_string(kMinWriteBufferNumberToMerge + 1));
+        continue;
+      }
+    }
     EXPECT_EQ(values[1], iter.second);
   }
   unlink(path);
@@ -122,8 +169,6 @@ TEST(Config, GetAndSet) {
       {"pidfile", "test.pid"},
       {"supervised", "no"},
       {"rocksdb.block_size", "1234"},
-      {"rocksdb.max_background_flushes", "-1"},
-      {"rocksdb.wal_ttl_seconds", "10000"},
       {"rocksdb.wal_size_limit_mb", "16"},
       {"rocksdb.enable_pipelined_write", "no"},
       {"rocksdb.cache_index_and_filter_blocks", "no"},
@@ -131,10 +176,6 @@ TEST(Config, GetAndSet) {
       {"rocksdb.subkey_block_cache_size", "100"},
       {"rocksdb.row_cache_size", "100"},
       {"rocksdb.rate_limiter_auto_tuned", "yes"},
-      {"rocksdb.compression_level", "32767"},
-      {"rocksdb.wal_compression", "no"},
-      {"histogram-bucket-boundaries", "10,100,1000,10000"},
-
   };
   for (const auto &iter : immutable_cases) {
     s = config.Set(nullptr, iter.first, iter.second);
@@ -147,19 +188,21 @@ TEST(Config, GetRenameCommand) {
   unlink(path);
 
   std::ofstream output_file(path, std::ios::out);
-  output_file << "rename-command KEYS KEYS_NEW"
+  output_file << "rename-command AUTH AUTH_NEW"
               << "\n";
   output_file << "rename-command GET GET_NEW"
               << "\n";
   output_file << "rename-command SET SET_NEW"
               << "\n";
   output_file.close();
+  SetDatanodeConfItems(path);
   redis::CommandTable::Reset();
   Config config;
-  ASSERT_TRUE(config.Load(CLIOptions(path)).IsOK());
+  auto s = config.Load(CLIOptions(path));
+  ASSERT_TRUE(s.IsOK());
   std::vector<std::string> values;
   config.Get("rename-command", &values);
-  ASSERT_EQ(values[1], "KEYS KEYS_NEW");
+  ASSERT_EQ(values[1], "AUTH AUTH_NEW");
   ASSERT_EQ(values[3], "GET GET_NEW");
   ASSERT_EQ(values[5], "SET SET_NEW");
   ASSERT_EQ(values[0], "rename-command");
@@ -172,19 +215,19 @@ TEST(Config, Rewrite) {
   unlink(path);
 
   std::ofstream output_file(path, std::ios::out);
-  output_file << "rename-command KEYS KEYS_NEW"
+  output_file << "rename-command AUTH AUTH_NEW"
               << "\n";
   output_file << "rename-command GET GET_NEW"
               << "\n";
   output_file << "rename-command SET SET_NEW"
               << "\n";
   output_file.close();
+  SetDatanodeConfItems(path);
 
   redis::CommandTable::Reset();
   Config config;
-  ASSERT_TRUE(config.Load(CLIOptions(path)).IsOK());
-  ASSERT_EQ(config.dir + "/backup", config.backup_dir);
-  ASSERT_EQ(config.dir + "/kvrocks.pid", config.pidfile);
+  auto s = config.Load(CLIOptions(path));
+  ASSERT_TRUE(s.IsOK());
   ASSERT_TRUE(config.Rewrite({}).IsOK());
   // Need to re-populate the command table since it has renamed by the previous
   redis::CommandTable::Reset();
@@ -224,46 +267,4 @@ TEST(Config, DumpConfigLine) {
   ASSERT_EQ(DumpConfigLine({"a", "x y"}), "a \"x y\"");
   ASSERT_EQ(DumpConfigLine({"a", "xy"}), "a xy");
   ASSERT_EQ(DumpConfigLine({"a", "x\n"}), "a \"x\\n\"");
-}
-
-TEST(Config, DisableL0Slowdown) {
-  Config config;
-  config.db_dir = "test_l0_slowdown_dir";
-
-  std::error_code ec;
-  std::filesystem::remove_all(config.db_dir, ec);
-  ASSERT_TRUE(!ec);
-
-  auto storage = std::make_unique<engine::Storage>(&config);
-  ASSERT_TRUE(storage->Open().IsOK());
-
-  Server server(storage.get(), &config);
-
-  const std::string kL0SlowdownWritesTrigger = "rocksdb.level0_slowdown_writes_trigger";
-  const std::string kL0StopWritesTrigger = "rocksdb.level0_stop_writes_trigger";
-
-  const auto slowdown_is = [&storage](int value) {
-    return storage->GetDB()->GetOptions().level0_slowdown_writes_trigger == value;
-  };
-
-  const auto stop_is = [&storage](int value) {
-    return storage->GetDB()->GetOptions().level0_stop_writes_trigger == value;
-  };
-
-  ASSERT_TRUE(config.Set(&server, kL0StopWritesTrigger, "20").IsOK());
-  ASSERT_TRUE(config.Set(&server, kL0SlowdownWritesTrigger, "0").IsOK());
-  ASSERT_TRUE(slowdown_is(20));
-  ASSERT_TRUE(stop_is(20));
-
-  ASSERT_TRUE(config.Set(&server, kL0StopWritesTrigger, "50").IsOK());
-  ASSERT_TRUE(slowdown_is(50));
-  ASSERT_TRUE(stop_is(50));
-
-  ASSERT_TRUE(config.Set(&server, kL0SlowdownWritesTrigger, "20").IsOK());
-  ASSERT_TRUE(slowdown_is(20));
-  ASSERT_TRUE(stop_is(50));
-
-  ASSERT_TRUE(config.Set(&server, kL0SlowdownWritesTrigger, "0").IsOK());
-  ASSERT_TRUE(slowdown_is(50));
-  ASSERT_TRUE(stop_is(50));
 }

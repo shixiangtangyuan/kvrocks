@@ -26,12 +26,17 @@
 
 #include "storage.h"
 
+struct CompactResult {
+  uint64_t compact_range_spent_ms = 0;
+  uint64_t compact_range_times = 0;
+  uint64_t compact_range_delete_tombs = 0;
+};
 class CompactionChecker {
  public:
   explicit CompactionChecker(engine::Storage *storage) : storage_(storage) {}
   ~CompactionChecker() = default;
-  void PickCompactionFilesForCf(const engine::ColumnFamilyConfig &cf_name);
-  void CompactPropagateAndPubSubFiles();
+  CompactResult PickCompactionFiles(const std::string &cf_name);
+  void CompactFullCF(const std::string &cf_name);
 
  private:
   engine::Storage *storage_ = nullptr;

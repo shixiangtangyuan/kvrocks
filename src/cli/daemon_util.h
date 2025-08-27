@@ -21,6 +21,7 @@
 #pragma once
 
 #include <config/config.h>
+#include <glog/logging.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -28,16 +29,15 @@
 
 #include <cstdlib>
 
-#include "logging.h"
 #include "unique_fd.h"
 
 inline bool SupervisedUpstart() {
   const char *upstart_job = getenv("UPSTART_JOB");
   if (!upstart_job) {
-    warn("upstart supervision requested, but UPSTART_JOB not found");
+    LOG(WARNING) << "upstart supervision requested, but UPSTART_JOB not found";
     return false;
   }
-  info("supervised by upstart, will stop to signal readiness");
+  LOG(INFO) << "supervised by upstart, will stop to signal readiness";
   raise(SIGSTOP);
   unsetenv("UPSTART_JOB");
   return true;
@@ -46,13 +46,13 @@ inline bool SupervisedUpstart() {
 inline bool SupervisedSystemd() {
   const char *notify_socket = getenv("NOTIFY_SOCKET");
   if (!notify_socket) {
-    warn("systemd supervision requested, but NOTIFY_SOCKET not found");
+    LOG(WARNING) << "systemd supervision requested, but NOTIFY_SOCKET not found";
     return false;
   }
 
   auto fd = UniqueFD(socket(AF_UNIX, SOCK_DGRAM, 0));
   if (!fd) {
-    warn("Cannot connect to systemd socket {}", notify_socket);
+    LOG(WARNING) << "Cannot connect to systemd socket " << notify_socket;
     return false;
   }
 
@@ -79,7 +79,7 @@ inline bool SupervisedSystemd() {
   sendto_flags |= MSG_NOSIGNAL;
 #endif
   if (sendmsg(*fd, &hdr, sendto_flags) < 0) {
-    warn("Cannot send notification to systemd");
+    LOG(WARNING) << "Cannot send notification to systemd";
     return false;
   }
   return true;
@@ -106,7 +106,7 @@ inline bool IsSupervisedMode(SupervisedMode mode) {
 inline void Daemonize() {
   pid_t pid = fork();
   if (pid < 0) {
-    error("Failed to fork the process, error: {}", strerror(errno));
+    LOG(ERROR) << "Failed to fork the process, err: " << strerror(errno);
     exit(1);
   }
 
@@ -114,7 +114,7 @@ inline void Daemonize() {
   // change the file mode
   umask(0);
   if (setsid() < 0) {
-    error("Failed to setsid, error: {}", strerror(errno));
+    LOG(ERROR) << "Failed to setsid, err: %s" << strerror(errno);
     exit(1);
   }
 

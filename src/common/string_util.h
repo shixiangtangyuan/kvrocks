@@ -20,67 +20,26 @@
 
 #pragma once
 
-#include <cstdint>
-#include <string>
-#include <string_view>
-#include <utility>
-#include <vector>
-
-#include "common/status.h"
+#include "status.h"
 
 namespace util {
 
-inline const char ASCII_WHITESPACES[] = " \t\r\n\v\f";
-
 std::string Float2String(double d);
 std::string ToLower(std::string in);
-std::string ToUpper(std::string in);
 bool EqualICase(std::string_view lhs, std::string_view rhs);
 std::string BytesToHuman(uint64_t n);
-std::string Trim(std::string in, std::string_view chars);
-std::vector<std::string> Split(std::string_view in, std::string_view delim);
+std::string Trim(std::string in, const std::string &chars);
+std::vector<std::string> Split(const std::string &in, const std::string &delim);
 std::vector<std::string> Split2KV(const std::string &in, const std::string &delim);
-
-bool StartsWith(std::string_view str, std::string_view prefix);
-bool EndsWith(std::string_view str, std::string_view suffix);
-bool StartsWithICase(std::string_view str, std::string_view prefix);
-bool EndsWithICase(std::string_view str, std::string_view suffix);
-
-template <typename Iter>
-Iter FindICase(Iter begin, Iter end, std::string_view expected) {
-  return std::find_if(begin, end, [expected](const auto &v) { return EqualICase(v, expected); });
-}
-
-Status ValidateGlob(std::string_view glob);
-bool StringMatch(std::string_view glob, std::string_view str, bool ignore_case = false);
-std::pair<std::string, std::string> SplitGlob(std::string_view glob);
-StatusOr<std::vector<std::string>> SplitArguments(std::string_view in);
-
+bool HasPrefix(const std::string &str, const std::string &prefix);
+bool IsPatternChar(char c);
+int StringMatch(const std::string &pattern, const std::string &in, int nocase);
+int StringMatchLen(const char *p, size_t plen, const char *s, size_t slen, int nocase);
 std::vector<std::string> RegexMatch(const std::string &str, const std::string &regex);
-std::string StringToHex(std::string_view input);
+std::string StringToHex(const std::string &input);
 std::vector<std::string> TokenizeRedisProtocol(const std::string &value);
-std::string EscapeString(std::string_view s);
-std::string StringNext(std::string s);
+std::string EscapeString(const std::string &s);
 
-template <typename T, typename F>
-std::string StringJoin(const T &con, F &&f, std::string_view sep = ", ") {
-  std::string res;
-  bool is_first = true;
-  for (const auto &v : con) {
-    if (is_first) {
-      is_first = false;
-    } else {
-      res += sep;
-    }
-    res += std::forward<F>(f)(v);
-  }
-  return res;
-}
-
-template <typename T>
-std::string StringJoin(const T &con, std::string_view sep = ", ") {
-  return StringJoin(
-      con, [](const auto &v) -> decltype(auto) { return v; }, sep);
-}
+const std::string &GetCurThreadId();
 
 }  // namespace util

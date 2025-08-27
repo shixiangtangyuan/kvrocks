@@ -26,6 +26,7 @@
 
 struct RangeLexSpec {
   std::string min, max;
+  std::string para_min, para_max;    // record the original paras in cmds
   bool minex = false, maxex = false; /* are min or max exclusive */
   bool max_infinite = false;         /* are max infinite */
   int64_t offset = -1, count = -1;
@@ -33,7 +34,7 @@ struct RangeLexSpec {
   explicit RangeLexSpec() = default;
 };
 
-Status ParseRangeLexSpec(const std::string &min, const std::string &max, RangeLexSpec *spec);
+Status ParseRangeLexSpec(const std::string &min, const std::string &max, RangeLexSpec *spec, bool record_para = false);
 
 struct RangeRankSpec {
   int start = 0, stop = -1;

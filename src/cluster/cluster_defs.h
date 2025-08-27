@@ -21,7 +21,6 @@
 #pragma once
 
 #include "cluster/redis_slot.h"
-#include "fmt/format.h"
 
 enum {
   kClusterMaster = 1,
@@ -32,45 +31,21 @@ enum {
 };
 
 inline constexpr const char *errInvalidNodeID = "Invalid cluster node id";
+inline constexpr const char *errInvalidNodeServingStatus = "Invalid cluster node serving status";
 inline constexpr const char *errInvalidSlotID = "Invalid slot id";
 inline constexpr const char *errSlotOutOfRange = "Slot is out of range";
-inline constexpr const char *errSlotRangeInvalid = "Slot range is invalid";
 inline constexpr const char *errInvalidClusterVersion = "Invalid cluster version";
+inline constexpr const char *errInvalidClusterRole = "Invalid cluster role";
+inline constexpr const char *errInvalidClusterPool = "Invalid cluster Pool";
+inline constexpr const char *errClusterIDNotMatch = "Cluster id does not match";
 inline constexpr const char *errSlotOverlapped = "Slot distribution is overlapped";
-inline constexpr const char *errNoMasterNode = "The node isn't a master";
-inline constexpr const char *errClusterNoInitialized = "The cluster is not initialized";
-inline constexpr const char *errInvalidClusterNodeInfo = "Invalid cluster nodes info";
+inline constexpr const char *errSlotNotEnough = "Slot distribution is not enough";
+inline constexpr const char *errInvalidMySlotRanges = "Invalid slotrange for myself";
+inline constexpr const char *errInvalidDBID = "Invalid DBId";
+inline constexpr const char *errSlotRangeNotMatchWithServing = "Slotrange not match with serving node";
+inline constexpr const char *errSlotRangeNotMatchWithImporting = "Slotrange not match with importing node";
+inline constexpr const char *errSlotRangeExists = "Slotrange already exists";
+inline constexpr const char *errWrongNodeTopoStatus = "Wrong topo status for this datanode";
+inline constexpr const char *errClusterNoInitialized = "CLUSTERDOWN The cluster is not initialized";
 inline constexpr const char *errInvalidImportState = "Invalid import state";
-
-/// SlotRange is a range of cluster slots covering [start, end],
-/// where the valid values for start and end are [0, kClusterSlots).
-/// When both start and end are -1, it usually indicates an empty or wrong SlotRange.
-struct SlotRange {
-  SlotRange(int start, int end) : start(start), end(end) {}
-  SlotRange() : start(-1), end(-1) {}
-  bool IsValid() const { return start >= 0 && end >= 0 && start <= end && end < kClusterSlots; }
-
-  /// Contains is used to determine whether a slot is within the SlotRange.
-  /// Note that if the SlotRange is invalid, it will always return False.
-  bool Contains(int slot) const { return IsValid() && slot >= start && slot <= end; }
-
-  /// HasOverlap is used to determine whether two SlotRanges overlap.
-  /// Note that if either SlotRange is invalid, it will always return False.
-  bool HasOverlap(const SlotRange &rhs) const {
-    return IsValid() && rhs.IsValid() && end >= rhs.start && rhs.end >= start;
-  }
-
-  std::string String() const {
-    if (!IsValid()) return "-1";
-    if (start == end) return fmt::format("{}", start);
-    return fmt::format("{}-{}", start, end);
-  }
-
-  static SlotRange GetPoint(int slot) { return {slot, slot}; }
-
-  bool operator==(const SlotRange &rhs) const { return start == rhs.start && end == rhs.end; }
-  bool operator!=(const SlotRange &rhs) const { return !(*this == rhs); }
-
-  int start;
-  int end;
-};
+inline constexpr const char *errDatanodeNotFoundInTopo = "Datanode not found in topo";

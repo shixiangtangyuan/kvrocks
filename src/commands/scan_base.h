@@ -20,116 +20,173 @@
 
 #pragma once
 
+#include <fmt/format.h>
+
 #include "commander.h"
-#include "commands/command_parser.h"
+#include "common/status.h"
 #include "error_constants.h"
-#include "glob.h"
 #include "parse_util.h"
 #include "server/server.h"
-#include "string_util.h"
+#include "storage/redis_metadata.h"
 
 namespace redis {
 
-inline constexpr const char *kCursorPrefix = "_";
+// inline constexpr const char *kCursorPrefix = "_";
 
 class CommandScanBase : public Commander {
  public:
-  Status Parse(const std::vector<std::string> &args) override {
-    CommandParser parser(args, 1);
+  Status ParseMatchAndCountParam(const std::string &type, std::string value) {
+    if (type == "match") {
+      pattern_ = std::move(value);
+      return Status::OK();
+    } else if (type == "count") {
+      auto parse_result = ParseInt<int64_t>(value, 10);
+      if (!parse_result) {
+        return {Status::RedisParseErr, errValueNotInteger};
+      }
 
-    PutCursor(GET_OR_RET(parser.TakeStr()));
+      if (*parse_result <= 0) {
+        return {Status::RedisParseErr, errInvalidSyntax};
+      }
 
-    return ParseAdditionalFlags<true>(parser);
-  }
-
-  template <bool IsScan, typename Parser>
-  Status ParseAdditionalFlags(Parser &parser) {
-    while (parser.Good()) {
-      if (parser.EatEqICase("match")) {
-        const std::string glob_pattern = GET_OR_RET(parser.TakeStr());
-        if (const Status s = util::ValidateGlob(glob_pattern); !s.IsOK()) {
-          return {Status::RedisParseErr, "Invalid glob pattern: " + s.Msg()};
-        }
-        std::tie(prefix_, suffix_glob_) = util::SplitGlob(glob_pattern);
-      } else if (parser.EatEqICase("count")) {
-        limit_ = GET_OR_RET(parser.TakeInt());
-        if (limit_ <= 0) {
-          return {Status::RedisParseErr, "limit should be a positive integer"};
-        }
-      } else if (IsScan && parser.EatEqICase("type")) {
-        std::string type_str = GET_OR_RET(parser.TakeStr());
-        if (auto iter = std::find(RedisTypeNames.begin(), RedisTypeNames.end(), type_str);
-            iter != RedisTypeNames.end()) {
-          type_ = static_cast<RedisType>(iter - RedisTypeNames.begin());
-        } else {
-          return {Status::RedisExecErr, "Invalid type"};
-        }
-      } else if (parser.EatEqICase("novalues")) {
-        no_values_ = true;
-      } else {
-        return parser.InvalidSyntax();
+      limit_ = *parse_result;
+    } else if (type == "type") {
+      if (GetAttributes()->name != "nodescan") {
+        return {Status::RedisParseErr, "TYPE option can only be used in NODESCAN"};
+      }
+      type_ = GetRedisTypeByName(value);
+      if (type_ == RedisType::kRedisNone) {
+        return {Status::RedisParseErr, fmt::format("Type '{}' is not a redis type", value)};
       }
     }
 
     return Status::OK();
   }
 
-  void PutCursor(const std::string &param) {
-    cursor_ = param;
-    if (cursor_ == "0") {
-      cursor_ = std::string();
-    } else {
-      cursor_ = cursor_.find(kCursorPrefix) == 0 ? cursor_.substr(strlen(kCursorPrefix)) : cursor_;
-    }
-  }
-
-  std::string GenerateOutput(Server *srv, [[maybe_unused]] const Connection *conn, const std::vector<std::string> &keys,
-                             CursorType cursor_type) const {
-    std::vector<std::string> list;
-    if (keys.size() == static_cast<size_t>(limit_)) {
-      auto end_cursor = srv->GenerateCursorFromKeyName(keys.back(), cursor_type);
-      list.emplace_back(redis::BulkString(end_cursor));
-    } else {
-      list.emplace_back(redis::BulkString("0"));
-    }
-
-    list.emplace_back(ArrayOfBulkStrings(keys));
-
-    return redis::Array(list);
-  }
-
  protected:
   std::string cursor_;
-  std::string prefix_;
-  std::string suffix_glob_ = "*";
-  int limit_ = 20;
-  RedisType type_ = kRedisNone;
-  bool no_values_ = false;
+  std::string pattern_;
+  int64_t limit_ = 10;
+  RedisType type_ = RedisType::kRedisNone;
 };
 
-class CommandSubkeyScanBase : public CommandScanBase {
+class CommandSubkeyScanBaseV2 : public CommandScanBase {
  public:
-  CommandSubkeyScanBase() : CommandScanBase() {}
+  CommandSubkeyScanBaseV2() : CommandScanBase() {}
 
   Status Parse(const std::vector<std::string> &args) override {
-    CommandParser parser(args, 1);
+    if (args.size() % 2 == 0) {
+      return {Status::RedisParseErr, errWrongNumOfArguments};
+    }
 
-    key_ = GET_OR_RET(parser.TakeStr());
+    key_ = args[1];
+    cursor_ = args[2];
+    if (args.size() >= 5) {
+      Status s = ParseMatchAndCountParam(util::ToLower(args[3]), args_[4]);
+      if (!s.IsOK()) {
+        return s;
+      }
+    }
 
-    PutCursor(GET_OR_RET(parser.TakeStr()));
-
-    return ParseAdditionalFlags<false>(parser);
+    if (args.size() >= 7) {
+      Status s = ParseMatchAndCountParam(util::ToLower(args[5]), args_[6]);
+      if (!s.IsOK()) {
+        return s;
+      }
+    }
+    return Commander::Parse(args);
   }
 
-  std::string GetNextCursor(Server *srv, std::vector<std::string> &fields, CursorType cursor_type) const {
-    if (fields.size() == static_cast<size_t>(limit_)) {
-      return srv->GenerateCursorFromKeyName(fields.back(), cursor_type);
+  std::string GenerateOutput(Server *srv, const std::vector<std::string> &keys) const {
+    auto cursor_str = cursor_.empty() ? redis::NilString() : redis::BulkString(cursor_);
+    return redis::Array({cursor_str, redis::MultiBulkString(keys, false)});
+  }
+
+  std::string GenerateOutput(Server *srv, const std::vector<std::string> &fields,
+                             const std::vector<std::string> &values) const {
+    std::vector<std::string> fvs;
+    if (auto count = fields.size(); count > 0) {
+      fvs.reserve(2 * count);
+      for (size_t i = 0; i < count; i++) {
+        fvs.emplace_back(fields[i]);
+        fvs.emplace_back(values[i]);
+      }
     }
-    return "0";
+    return GenerateOutput(srv, fvs);
   }
 
  protected:
   std::string key_;
+};
+
+class CommandSubkeyScanBaseV1 : public CommandScanBase {
+ public:
+  CommandSubkeyScanBaseV1() : CommandScanBase() {}
+
+  Status Parse(const std::vector<std::string> &args) override {
+    if (util::EqualICase(args[args.size() - 1], "novalues")) {
+      if (GetAttributes()->name != "hscan") {
+        return {Status::RedisParseErr, "NOVALUES option can only be used in HSCAN"};
+      }
+      if (args.size() % 2 == 1) {
+        return {Status::RedisParseErr, errWrongNumOfArguments};
+      }
+      hscan_no_values_ = true;
+    } else {
+      if (args.size() % 2 == 0) {
+        return {Status::RedisParseErr, errWrongNumOfArguments};
+      }
+      hscan_no_values_ = false;
+    }
+
+    key_ = args[1];
+    auto ret = ParseInt<uint64_t>(args[2], 10);
+    if (!ret) {
+      return {Status::NotOK, "invalid cursor"};
+    }
+    redis_cursor_ = ret.GetValue();
+
+    if (args.size() >= 5) {
+      Status s = ParseMatchAndCountParam(util::ToLower(args[3]), args_[4]);
+      if (!s.IsOK()) {
+        return s;
+      }
+    }
+
+    if (args.size() >= 7) {
+      Status s = ParseMatchAndCountParam(util::ToLower(args[5]), args_[6]);
+      if (!s.IsOK()) {
+        return s;
+      }
+    }
+
+    return Commander::Parse(args);
+  }
+
+  static std::string GenerateOutput(Server *srv, const uint64_t cursor, const std::vector<std::string> &fields) {
+    std::vector<std::string> list;
+    list.emplace_back(redis::BulkString(std::to_string(cursor)));
+    list.emplace_back(redis::MultiBulkString(fields, false));
+    return redis::Array(list);
+  }
+
+  static std::string GenerateOutput(Server *srv, const uint64_t cursor, const std::vector<std::string> &fields,
+                                    const std::vector<std::string> &values) {
+    std::vector<std::string> fvs;
+    if (auto count = fields.size(); count > 0) {
+      fvs.reserve(2 * count);
+      for (size_t i = 0; i < count; i++) {
+        fvs.emplace_back(fields[i]);
+        fvs.emplace_back(values[i]);
+      }
+    }
+    return GenerateOutput(srv, cursor, fvs);
+  }
+
+ protected:
+  std::string key_;
+  uint64_t redis_cursor_;
+  bool hscan_no_values_;
 };
 
 }  // namespace redis

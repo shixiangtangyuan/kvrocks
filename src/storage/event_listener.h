@@ -20,9 +20,9 @@
 
 #pragma once
 
+#include <glog/logging.h>
 #include <rocksdb/listener.h>
 
-#include "logging.h"
 #include "storage.h"
 
 class EventListener : public rocksdb::EventListener {
@@ -31,17 +31,11 @@ class EventListener : public rocksdb::EventListener {
   ~EventListener() override = default;
   void OnFlushBegin(rocksdb::DB *db, const rocksdb::FlushJobInfo &fi) override;
   void OnFlushCompleted(rocksdb::DB *db, const rocksdb::FlushJobInfo &fi) override;
-  void OnCompactionBegin(rocksdb::DB *db, const rocksdb::CompactionJobInfo &ci) override;
   void OnCompactionCompleted(rocksdb::DB *db, const rocksdb::CompactionJobInfo &ci) override;
-  void OnSubcompactionBegin(const rocksdb::SubcompactionJobInfo &si) override;
-  void OnSubcompactionCompleted(const rocksdb::SubcompactionJobInfo &si) override;
-
   void OnBackgroundError(rocksdb::BackgroundErrorReason reason, rocksdb::Status *status) override;
+  void OnTableFileDeleted(const rocksdb::TableFileDeletionInfo &info) override;
   void OnStallConditionsChanged(const rocksdb::WriteStallInfo &info) override;
-  void OnTableFileCreated(const rocksdb::TableFileCreationInfo &table_info) override;
-  void OnTableFileDeleted(const rocksdb::TableFileDeletionInfo &table_info) override;
-  void OnBlobFileCreated(const rocksdb::BlobFileCreationInfo &blob_info) override;
-  void OnBlobFileDeleted(const rocksdb::BlobFileDeletionInfo &blob_info) override;
+  void OnTableFileCreated(const rocksdb::TableFileCreationInfo &info) override;
 
  private:
   engine::Storage *storage_ = nullptr;

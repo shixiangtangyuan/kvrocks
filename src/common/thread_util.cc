@@ -27,9 +27,16 @@ namespace util {
 
 void ThreadSetName(const char *name) {
 #ifdef __APPLE__
+  // Apple supports 64 characters, and will
+  // truncate if it's longer.
   pthread_setname_np(name);
 #else
-  pthread_setname_np(pthread_self(), name);
+  // Linux supports 16 characters max, and will
+  // error if it's longer.
+  char buf[16];
+  strncpy(buf, name, 15);
+  buf[15] = '\0';
+  pthread_setname_np(pthread_self(), buf);
 #endif
 }
 

@@ -21,9 +21,6 @@ package config
 
 import (
 	"context"
-	"log"
-	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"sync"
@@ -36,12 +33,10 @@ import (
 )
 
 func TestRenameCommand(t *testing.T) {
-	t.Parallel()
 	srv := util.StartServer(t, map[string]string{
-		"resp3-enabled":       "no",
-		"rename-command KEYS": "KEYSNEW",
-		"rename-command GET":  "GETNEW",
-		"rename-command SET":  "SETNEW",
+		// "rename-command KEYS": "KEYSNEW",
+		"rename-command GET": "GETNEW",
+		"rename-command SET": "SETNEW",
 	})
 	defer srv.Close()
 
@@ -51,7 +46,6 @@ func TestRenameCommand(t *testing.T) {
 	require.ErrorContains(t, rdb.Keys(ctx, "*").Err(), "unknown command")
 	require.ErrorContains(t, rdb.Get(ctx, "key").Err(), "unknown command")
 	require.ErrorContains(t, rdb.Set(ctx, "key", "1", 0).Err(), "unknown command")
-	require.Equal(t, []interface{}{}, rdb.Do(ctx, "KEYSNEW", "*").Val())
 	require.NoError(t, rdb.Do(ctx, "SETNEW", "key", "1").Err())
 	require.Equal(t, "1", rdb.Do(ctx, "GETNEW", "key").Val())
 	val := []string{}
@@ -59,59 +53,10 @@ func TestRenameCommand(t *testing.T) {
 		val = append(val, v.(string))
 	}
 	sort.Strings(val)
-	require.EqualValues(t, []string{"GET GETNEW", "KEYS KEYSNEW", "SET SETNEW", "rename-command", "rename-command", "rename-command"}, val)
-}
-
-func TestSetConfigBackupDir(t *testing.T) {
-	t.Parallel()
-	configs := map[string]string{}
-	srv := util.StartServer(t, configs)
-	defer srv.Close()
-
-	ctx := context.Background()
-	rdb := srv.NewClient()
-	defer func() { require.NoError(t, rdb.Close()) }()
-
-	originBackupDir := filepath.Join(configs["dir"], "backup")
-
-	r := rdb.ConfigGet(ctx, "backup-dir").Val()
-	require.EqualValues(t, r["backup-dir"], originBackupDir)
-
-	hasCompactionFiles := func(dir string) bool {
-		if _, err := os.Stat(dir); os.IsNotExist(err) {
-			return false
-		}
-		files, err := os.ReadDir(dir)
-		if err != nil {
-			log.Fatal(err)
-		}
-		return len(files) != 0
-	}
-
-	require.False(t, hasCompactionFiles(originBackupDir))
-
-	require.NoError(t, rdb.Do(ctx, "bgsave").Err())
-	time.Sleep(2000 * time.Millisecond)
-
-	require.True(t, hasCompactionFiles(originBackupDir))
-
-	newBackupDir := filepath.Join(configs["dir"], "backup2")
-
-	require.False(t, hasCompactionFiles(newBackupDir))
-
-	require.NoError(t, rdb.ConfigSet(ctx, "backup-dir", newBackupDir).Err())
-	r = rdb.ConfigGet(ctx, "backup-dir").Val()
-	require.EqualValues(t, r["backup-dir"], newBackupDir)
-
-	require.NoError(t, rdb.BgSave(ctx).Err())
-	time.Sleep(2000 * time.Millisecond)
-
-	require.True(t, hasCompactionFiles(newBackupDir))
-	require.True(t, hasCompactionFiles(originBackupDir))
+	require.EqualValues(t, []string{"GET GETNEW", "SET SETNEW", "rename-command", "rename-command"}, val)
 }
 
 func TestConfigSetCompression(t *testing.T) {
-	t.Parallel()
 	configs := map[string]string{}
 	srv := util.StartServer(t, configs)
 	defer srv.Close()
@@ -132,22 +77,7 @@ func TestConfigSetCompression(t *testing.T) {
 	require.ErrorContains(t, rdb.ConfigSet(ctx, configKey, "unsupported").Err(), "invalid enum option")
 }
 
-func TestConfigGetRESP3(t *testing.T) {
-	t.Parallel()
-	srv := util.StartServer(t, map[string]string{
-		"resp3-enabled": "yes",
-	})
-	defer srv.Close()
-
-	ctx := context.Background()
-	rdb := srv.NewClient()
-	defer func() { require.NoError(t, rdb.Close()) }()
-	val := rdb.ConfigGet(ctx, "resp3-enabled").Val()
-	require.EqualValues(t, "yes", val["resp3-enabled"])
-}
-
 func TestStartWithoutConfigurationFile(t *testing.T) {
-	t.Parallel()
 	srv := util.StartServerWithCLIOptions(t, false, map[string]string{}, []string{})
 	defer srv.Close()
 
@@ -160,7 +90,6 @@ func TestStartWithoutConfigurationFile(t *testing.T) {
 }
 
 func TestDynamicChangeWorkerThread(t *testing.T) {
-	t.Parallel()
 	configs := map[string]string{}
 	srv := util.StartServer(t, configs)
 	defer srv.Close()
@@ -245,153 +174,5 @@ func TestDynamicChangeWorkerThread(t *testing.T) {
 		// requests after changing worker threads.
 		require.NoError(t, rdb.Set(ctx, "foo", "bar", 0).Err())
 		require.Equal(t, "bar", rdb.Get(ctx, "foo").Val())
-	})
-}
-
-func TestChangeProtoMaxBulkLen(t *testing.T) {
-	t.Parallel()
-	configs := map[string]string{}
-	srv := util.StartServer(t, configs)
-	defer srv.Close()
-
-	ctx := context.Background()
-	rdb := srv.NewClient()
-	defer func() { require.NoError(t, rdb.Close()) }()
-
-	// Default value is 512MB
-	vals, err := rdb.ConfigGet(ctx, "proto-max-bulk-len").Result()
-	require.NoError(t, err)
-	require.EqualValues(t, "536870912", vals["proto-max-bulk-len"])
-
-	// Change to 2MB
-	require.NoError(t, rdb.ConfigSet(ctx, "proto-max-bulk-len", "2097152").Err())
-	vals, err = rdb.ConfigGet(ctx, "proto-max-bulk-len").Result()
-	require.NoError(t, err)
-	require.EqualValues(t, "2097152", vals["proto-max-bulk-len"])
-
-	// change to 100MB
-	require.NoError(t, rdb.ConfigSet(ctx, "proto-max-bulk-len", "100M").Err())
-	vals, err = rdb.ConfigGet(ctx, "proto-max-bulk-len").Result()
-	require.NoError(t, err)
-	require.EqualValues(t, "104857600", vals["proto-max-bulk-len"])
-
-	// Must be >= 1MB
-	require.Error(t, rdb.ConfigSet(ctx, "proto-max-bulk-len", "1024").Err())
-}
-
-func TestGetConfigTxnContext(t *testing.T) {
-	t.Parallel()
-	srv := util.StartServer(t, map[string]string{
-		"txn-context-enabled": "yes",
-	})
-	defer srv.Close()
-
-	ctx := context.Background()
-	rdb := srv.NewClient()
-	defer func() { require.NoError(t, rdb.Close()) }()
-	val := rdb.ConfigGet(ctx, "txn-context-enabled").Val()
-	require.EqualValues(t, "yes", val["txn-context-enabled"])
-
-	// default value "no"
-	srv1 := util.StartServer(t, map[string]string{})
-	defer srv1.Close()
-
-	rdb = srv1.NewClient()
-	val = rdb.ConfigGet(ctx, "txn-context-enabled").Val()
-	require.EqualValues(t, "no", val["txn-context-enabled"])
-}
-
-func TestGenerateConfigsMatrix(t *testing.T) {
-	t.Parallel()
-	configOptions := []util.ConfigOptions{
-		{
-			Name:       "txn-context-enabled",
-			Options:    []string{"yes", "no"},
-			ConfigType: util.YesNo,
-		},
-		{
-			Name:       "resp3-enabled",
-			Options:    []string{"yes", "no"},
-			ConfigType: util.YesNo,
-		},
-	}
-
-	configsMatrix, err := util.GenerateConfigsMatrix(configOptions)
-
-	require.NoError(t, err)
-	require.Equal(t, 4, len(configsMatrix))
-	require.Contains(t, configsMatrix, util.KvrocksServerConfigs{"txn-context-enabled": "yes", "resp3-enabled": "yes"})
-	require.Contains(t, configsMatrix, util.KvrocksServerConfigs{"txn-context-enabled": "yes", "resp3-enabled": "no"})
-	require.Contains(t, configsMatrix, util.KvrocksServerConfigs{"txn-context-enabled": "no", "resp3-enabled": "yes"})
-	require.Contains(t, configsMatrix, util.KvrocksServerConfigs{"txn-context-enabled": "no", "resp3-enabled": "no"})
-}
-
-func TestGetConfigSkipBlockCacheDeallocationOnClose(t *testing.T) {
-	t.Parallel()
-	srv := util.StartServer(t, map[string]string{
-		"skip-block-cache-deallocation-on-close": "yes",
-	})
-	defer srv.Close()
-
-	ctx := context.Background()
-	rdb := srv.NewClient()
-	defer func() { require.NoError(t, rdb.Close()) }()
-	val := rdb.ConfigGet(ctx, "skip-block-cache-deallocation-on-close").Val()
-	require.EqualValues(t, "yes", val["skip-block-cache-deallocation-on-close"])
-
-	// default value "no"
-	srv1 := util.StartServer(t, map[string]string{})
-	defer srv1.Close()
-
-	rdb = srv1.NewClient()
-	val = rdb.ConfigGet(ctx, "skip-block-cache-deallocation-on-close").Val()
-	require.EqualValues(t, "no", val["skip-block-cache-deallocation-on-close"])
-}
-
-func TestConfigRocksDBOptions(t *testing.T) {
-	t.Parallel()
-	srv := util.StartServer(t, map[string]string{})
-	defer srv.Close()
-
-	rdb := srv.NewClient()
-	defer func() { require.NoError(t, rdb.Close()) }()
-
-	t.Run("Get and Set rocksdb.max_compaction_bytes", func(t *testing.T) {
-		ctx := context.Background()
-		parameter := "rocksdb.max_compaction_bytes"
-		result, err := rdb.ConfigGet(ctx, parameter).Result()
-		require.NoError(t, err)
-		require.EqualValues(t, "0", result[parameter])
-
-		util.ErrorRegexp(t, rdb.ConfigSet(ctx, parameter, "-1").Err(), ".*out of numeric range")
-
-		require.NoError(t, rdb.ConfigSet(ctx, parameter, "1073741824").Err())
-		result, err = rdb.ConfigGet(ctx, parameter).Result()
-		require.NoError(t, err)
-		require.EqualValues(t, "1073741824", result[parameter])
-	})
-}
-
-func TestConfigSstFileDeleteRateBytesPerSec(t *testing.T) {
-	t.Parallel()
-	srv := util.StartServer(t, map[string]string{})
-	defer srv.Close()
-
-	cli := srv.NewClient()
-	defer func() { require.NoError(t, cli.Close()) }()
-
-	t.Run("Get and Set rocksdb.sst_file_delete_rate_bytes_per_sec", func(t *testing.T) {
-		ctx := context.Background()
-		parameter := "rocksdb.sst_file_delete_rate_bytes_per_sec"
-		result, err := cli.ConfigGet(ctx, parameter).Result()
-		require.NoError(t, err)
-		require.EqualValues(t, "0", result[parameter])
-
-		util.ErrorRegexp(t, cli.ConfigSet(ctx, parameter, "-1").Err(), ".*out of numeric range")
-
-		require.NoError(t, cli.ConfigSet(ctx, parameter, "1073741824").Err())
-		result, err = cli.ConfigGet(ctx, parameter).Result()
-		require.NoError(t, err)
-		require.EqualValues(t, "1073741824", result[parameter])
 	})
 }

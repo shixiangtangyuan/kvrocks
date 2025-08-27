@@ -20,28 +20,43 @@
 
 #pragma once
 
+#include <execinfo.h>
+#include <glog/logging.h>
 #include <signal.h>
 
-#include <cpptrace/cpptrace.hpp>
 #include <cstddef>
 #include <iomanip>
-#include <sstream>
 
-#include "logging.h"
 #include "version_util.h"
 
-extern "C" inline void SegvHandler(int sig, [[maybe_unused]] siginfo_t *info, [[maybe_unused]] void *secret) {
-  error("Ooops! Apache Kvrocks {} got signal: {} ({})", PrintVersion(), strsignal(sig), sig);
-  auto trace = cpptrace::generate_trace();
+namespace google {
+bool Symbolize(void *pc, char *out, size_t out_size);
+}  // namespace google
 
-  std::string trace_str;
-  std::ostringstream os(trace_str);
-  trace.print(os);
+extern "C" inline void SegvHandler(int sig, siginfo_t *info, void *secret) {
+  void *trace[100];
 
-  error("{}", os.str());
-  error(
-      "It would be greatly appreciated if you could submit this crash to https://github.com/apache/kvrocks/issues "
-      "along with the stacktrace above, logs and any relevant information.");
+  LOG(ERROR) << "======= Ooops! datanode " << PrintVersion << " got signal: " << strsignal(sig) << " (" << sig
+             << ") =======";
+  int trace_size = backtrace(trace, sizeof(trace) / sizeof(void *));
+  char **messages = backtrace_symbols(trace, trace_size);
+
+  size_t max_msg_len = 0;
+  for (int i = 1; i < trace_size; ++i) {
+    auto msg_len = strlen(messages[i]);
+    if (msg_len > max_msg_len) {
+      max_msg_len = msg_len;
+    }
+  }
+
+  for (int i = 1; i < trace_size; ++i) {
+    char func_info[1024] = {};
+    if (google::Symbolize(trace[i], func_info, sizeof(func_info) - 1)) {
+      LOG(ERROR) << std::left << std::setw(static_cast<int>(max_msg_len)) << messages[i] << "  " << func_info;
+    } else {
+      LOG(ERROR) << messages[i];
+    }
+  }
 
   struct sigaction act;
   /* Make sure we exit with the right signal at the end. So for instance

@@ -22,6 +22,7 @@
 
 #include "commander.h"
 #include "commands/scan_base.h"
+#include "common/scope_exit.h"
 #include "error_constants.h"
 #include "server/server.h"
 #include "types/redis_set.h"
@@ -30,20 +31,18 @@ namespace redis {
 
 class CommandSAdd : public Commander {
  public:
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
     std::vector<Slice> members;
     for (unsigned int i = 2; i < args_.size(); i++) {
       members.emplace_back(args_[i]);
     }
-
+    estimated_subkey_count_ = static_cast<int64_t>(members.size());
     uint64_t ret = 0;
-    redis::Set set_db(srv->storage, conn->GetNamespace());
-
-    auto s = set_db.Add(ctx, args_[1], members, &ret);
+    redis::Set set_db(storage, conn->GetNamespace());
+    auto s = set_db.Add(args_[1], members, &ret);
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
     }
-
     *output = redis::Integer(ret);
     return Status::OK();
   }
@@ -51,16 +50,15 @@ class CommandSAdd : public Commander {
 
 class CommandSRem : public Commander {
  public:
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
     std::vector<Slice> members;
     for (size_t i = 2; i < args_.size(); i++) {
       members.emplace_back(args_[i]);
     }
-
+    estimated_subkey_count_ = static_cast<int64_t>(members.size());
     uint64_t ret = 0;
-    redis::Set set_db(srv->storage, conn->GetNamespace());
-
-    auto s = set_db.Remove(ctx, args_[1], members, &ret);
+    redis::Set set_db(storage, conn->GetNamespace());
+    auto s = set_db.Remove(args_[1], members, &ret);
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -72,11 +70,10 @@ class CommandSRem : public Commander {
 
 class CommandSCard : public Commander {
  public:
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
-    redis::Set set_db(srv->storage, conn->GetNamespace());
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
+    redis::Set set_db(storage, conn->GetNamespace());
     uint64_t ret = 0;
-
-    auto s = set_db.Card(ctx, args_[1], &ret);
+    auto s = set_db.Card(args_[1], &ret);
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -88,27 +85,25 @@ class CommandSCard : public Commander {
 
 class CommandSMembers : public Commander {
  public:
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
-    redis::Set set_db(srv->storage, conn->GetNamespace());
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
+    redis::Set set_db(storage, conn->GetNamespace());
     std::vector<std::string> members;
-
-    auto s = set_db.Members(ctx, args_[1], &members);
+    auto s = set_db.Members(args_[1], &members);
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
     }
-
-    *output = conn->SetOfBulkStrings(members);
+    estimated_subkey_count_ = static_cast<int64_t>(members.size());
+    *output = redis::MultiBulkString(members, false);
     return Status::OK();
   }
 };
 
 class CommandSIsMember : public Commander {
  public:
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
-    redis::Set set_db(srv->storage, conn->GetNamespace());
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
+    redis::Set set_db(storage, conn->GetNamespace());
     bool ret = false;
-
-    auto s = set_db.IsMember(ctx, args_[1], args_[2], &ret);
+    auto s = set_db.IsMember(args_[1], args_[2], &ret);
     if (!s.ok() && !s.IsNotFound()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -120,16 +115,15 @@ class CommandSIsMember : public Commander {
 
 class CommandSMIsMember : public Commander {
  public:
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
-    redis::Set set_db(srv->storage, conn->GetNamespace());
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
+    redis::Set set_db(storage, conn->GetNamespace());
     std::vector<Slice> members;
     for (size_t i = 2; i < args_.size(); i++) {
       members.emplace_back(args_[i]);
     }
-
+    estimated_subkey_count_ = static_cast<int64_t>(members.size());
     std::vector<int> exists;
-
-    auto s = set_db.MIsMember(ctx, args_[1], members, &exists);
+    auto s = set_db.MIsMember(args_[1], members, &exists);
     if (!s.ok() && !s.IsNotFound()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -156,7 +150,7 @@ class CommandSPop : public Commander {
     if (args.size() == 3) {
       auto parse_result = ParseInt<int>(args[2], 10);
       if (!parse_result) {
-        return {Status::RedisParseErr, errValueNotInteger};
+        return {Status::RedisParseErr, errValueMustBePositive};
       }
       if (*parse_result < 0) {
         return {Status::RedisParseErr, errValueMustBePositive};
@@ -168,22 +162,21 @@ class CommandSPop : public Commander {
     return Commander::Parse(args);
   }
 
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
-    redis::Set set_db(srv->storage, conn->GetNamespace());
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
+    redis::Set set_db(storage, conn->GetNamespace());
     std::vector<std::string> members;
-
-    auto s = set_db.Take(ctx, args_[1], &members, count_, true);
+    auto s = set_db.Take(args_[1], &members, count_, true);
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
     }
-
+    estimated_subkey_count_ = static_cast<int64_t>(members.size());
     if (with_count_) {
-      *output = conn->SetOfBulkStrings(members);
+      *output = redis::MultiBulkString(members, false);
     } else {
       if (members.size() > 0) {
         *output = redis::BulkString(members.front());
       } else {
-        *output = conn->NilString();
+        *output = redis::NilString();
       }
     }
     return Status::OK();
@@ -207,33 +200,39 @@ class CommandSRandMember : public Commander {
       }
 
       count_ = *parse_result;
+      has_count_ = true;
     }
     return Commander::Parse(args);
   }
 
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
-    redis::Set set_db(srv->storage, conn->GetNamespace());
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
+    redis::Set set_db(storage, conn->GetNamespace());
     std::vector<std::string> members;
-
-    auto s = set_db.Take(ctx, args_[1], &members, count_, false);
+    auto s = set_db.Take(args_[1], &members, count_, false);
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
     }
-    *output = conn->SetOfBulkStrings(members);
+    estimated_subkey_count_ = static_cast<int64_t>(members.size());
+    if (!has_count_) {
+      members.empty() ? *output = redis::NilString() : *output = redis::BulkString(members.front());
+    } else {
+      *output = redis::MultiBulkString(members, false);
+    }
+
     return Status::OK();
   }
 
  private:
   int count_ = 1;
+  bool has_count_ = false;
 };
 
 class CommandSMove : public Commander {
  public:
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
-    redis::Set set_db(srv->storage, conn->GetNamespace());
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
+    redis::Set set_db(storage, conn->GetNamespace());
     bool ret = false;
-
-    auto s = set_db.Move(ctx, args_[1], args_[2], args_[3], &ret);
+    auto s = set_db.Move(args_[1], args_[2], args_[3], &ret);
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -245,63 +244,60 @@ class CommandSMove : public Commander {
 
 class CommandSDiff : public Commander {
  public:
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
     std::vector<Slice> keys;
     for (size_t i = 1; i < args_.size(); i++) {
       keys.emplace_back(args_[i]);
     }
 
     std::vector<std::string> members;
-    redis::Set set_db(srv->storage, conn->GetNamespace());
-
-    auto s = set_db.Diff(ctx, keys, &members);
+    redis::Set set_db(storage, conn->GetNamespace());
+    auto s = set_db.Diff(keys, &members);
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
     }
 
-    *output = conn->SetOfBulkStrings(members);
+    *output = redis::MultiBulkString(members, false);
     return Status::OK();
   }
 };
 
 class CommandSUnion : public Commander {
  public:
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
     std::vector<Slice> keys;
     for (size_t i = 1; i < args_.size(); i++) {
       keys.emplace_back(args_[i]);
     }
 
     std::vector<std::string> members;
-    redis::Set set_db(srv->storage, conn->GetNamespace());
-
-    auto s = set_db.Union(ctx, keys, &members);
+    redis::Set set_db(storage, conn->GetNamespace());
+    auto s = set_db.Union(keys, &members);
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
     }
 
-    *output = conn->SetOfBulkStrings(members);
+    *output = redis::MultiBulkString(members, false);
     return Status::OK();
   }
 };
 
 class CommandSInter : public Commander {
  public:
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
     std::vector<Slice> keys;
     for (size_t i = 1; i < args_.size(); i++) {
       keys.emplace_back(args_[i]);
     }
 
     std::vector<std::string> members;
-    redis::Set set_db(srv->storage, conn->GetNamespace());
-
-    auto s = set_db.Inter(ctx, keys, &members);
+    redis::Set set_db(storage, conn->GetNamespace());
+    auto s = set_db.Inter(keys, &members);
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
     }
 
-    *output = conn->SetOfBulkStrings(members);
+    *output = redis::MultiBulkString(members, false);
     return Status::OK();
   }
 };
@@ -345,16 +341,15 @@ class CommandSInterCard : public Commander {
     return Commander::Parse(args);
   }
 
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
     std::vector<Slice> keys;
     for (size_t i = 2; i < numkeys_ + 2; i++) {
       keys.emplace_back(args_[i]);
     }
 
-    redis::Set set_db(srv->storage, conn->GetNamespace());
+    redis::Set set_db(storage, conn->GetNamespace());
     uint64_t ret = 0;
-
-    auto s = set_db.InterCard(ctx, keys, limit_, &ret);
+    auto s = set_db.InterCard(keys, limit_, &ret);
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -375,16 +370,15 @@ class CommandSInterCard : public Commander {
 
 class CommandSDiffStore : public Commander {
  public:
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
     std::vector<Slice> keys;
     for (size_t i = 2; i < args_.size(); i++) {
       keys.emplace_back(args_[i]);
     }
 
     uint64_t ret = 0;
-    redis::Set set_db(srv->storage, conn->GetNamespace());
-
-    auto s = set_db.DiffStore(ctx, args_[1], keys, &ret);
+    redis::Set set_db(storage, conn->GetNamespace());
+    auto s = set_db.DiffStore(args_[1], keys, &ret);
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -396,16 +390,15 @@ class CommandSDiffStore : public Commander {
 
 class CommandSUnionStore : public Commander {
  public:
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
     std::vector<Slice> keys;
     for (size_t i = 2; i < args_.size(); i++) {
       keys.emplace_back(args_[i]);
     }
 
     uint64_t ret = 0;
-    redis::Set set_db(srv->storage, conn->GetNamespace());
-
-    auto s = set_db.UnionStore(ctx, args_[1], keys, &ret);
+    redis::Set set_db(storage, conn->GetNamespace());
+    auto s = set_db.UnionStore(args_[1], keys, &ret);
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -417,16 +410,15 @@ class CommandSUnionStore : public Commander {
 
 class CommandSInterStore : public Commander {
  public:
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
     std::vector<Slice> keys;
     for (size_t i = 2; i < args_.size(); i++) {
       keys.emplace_back(args_[i]);
     }
 
     uint64_t ret = 0;
-    redis::Set set_db(srv->storage, conn->GetNamespace());
-
-    auto s = set_db.InterStore(ctx, args_[1], keys, &ret);
+    redis::Set set_db(storage, conn->GetNamespace());
+    auto s = set_db.InterStore(args_[1], keys, &ret);
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -436,40 +428,68 @@ class CommandSInterStore : public Commander {
   }
 };
 
-class CommandSScan : public CommandSubkeyScanBase {
+class CommandSScan : public CommandSubkeyScanBaseV1 {
  public:
   CommandSScan() = default;
-  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
-    redis::Set set_db(srv->storage, conn->GetNamespace());
-    std::vector<std::string> members;
-    auto key_name = srv->GetKeyNameFromCursor(cursor_, CursorType::kTypeSet);
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
+    CursorPair cursor_pair;
+    auto ret = srv->xscan_lru_cache->GetScanSession(redis_cursor_, -1, -1, &cursor_pair, CursorType::kTypeSet, key_);
+    if (!ret.IsOK()) {
+      return ret.ToStatus();
+    }
+    auto session = ret.GetValue();
+    auto scope_exit = MakeScopeExit([&session] { session->ResetInUsing(); });
+    std::string store_cursor;
+    if (redis_cursor_ == cursor_pair.client_cursor) {
+      store_cursor = std::move(cursor_pair.store_cursor);
+    }
 
-    auto s = set_db.Scan(ctx, key_, key_name, limit_, prefix_, &members);
+    redis::Set set_db(storage, conn->GetNamespace());
+    std::vector<std::string> members;
+    auto s = set_db.Scan(key_, &store_cursor, limit_, pattern_, &members, &estimated_subkey_count_);
     if (!s.ok() && !s.IsNotFound()) {
       return {Status::RedisExecErr, s.ToString()};
     }
 
-    *output = CommandScanBase::GenerateOutput(srv, conn, members, CursorType::kTypeSet);
+    auto new_cursor = session->Update(store_cursor);
+    *output = CommandSubkeyScanBaseV1::GenerateOutput(srv, new_cursor, members);
     return Status::OK();
   }
 };
 
-REDIS_REGISTER_COMMANDS(Set, MakeCmdAttr<CommandSAdd>("sadd", -3, "write", 1, 1, 1),
-                        MakeCmdAttr<CommandSRem>("srem", -3, "write no-dbsize-check", 1, 1, 1),
+class CommandSScanV2 : public CommandSubkeyScanBaseV2 {
+ public:
+  CommandSScanV2() = default;
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
+    redis::Set set_db(storage, conn->GetNamespace());
+    std::vector<std::string> members;
+    auto s = set_db.Scan(key_, &cursor_, limit_, pattern_, &members, &estimated_subkey_count_);
+    if (!s.ok() && !s.IsNotFound()) {
+      return {Status::RedisExecErr, s.ToString()};
+    }
+
+    *output = CommandSubkeyScanBaseV2::GenerateOutput(srv, members);
+    return Status::OK();
+  }
+};
+
+REDIS_REGISTER_COMMANDS(MakeCmdAttr<CommandSAdd>("sadd", -3, "write", 1, 1, 1),
+                        MakeCmdAttr<CommandSRem>("srem", -3, "write", 1, 1, 1),
                         MakeCmdAttr<CommandSCard>("scard", 2, "read-only", 1, 1, 1),
-                        MakeCmdAttr<CommandSMembers>("smembers", 2, "read-only slow", 1, 1, 1),
+                        MakeCmdAttr<CommandSMembers>("smembers", 2, "read-only", 1, 1, 1),
                         MakeCmdAttr<CommandSIsMember>("sismember", 3, "read-only", 1, 1, 1),
                         MakeCmdAttr<CommandSMIsMember>("smismember", -3, "read-only", 1, 1, 1),
                         MakeCmdAttr<CommandSPop>("spop", -2, "write", 1, 1, 1),
-                        MakeCmdAttr<CommandSRandMember>("srandmember", -2, "read-only slow", 1, 1, 1),
-                        MakeCmdAttr<CommandSMove>("smove", 4, "write", 1, 2, 1),
-                        MakeCmdAttr<CommandSDiff>("sdiff", -2, "read-only slow", 1, -1, 1),
-                        MakeCmdAttr<CommandSUnion>("sunion", -2, "read-only slow", 1, -1, 1),
-                        MakeCmdAttr<CommandSInter>("sinter", -2, "read-only slow", 1, -1, 1),
-                        MakeCmdAttr<CommandSInterCard>("sintercard", -3, "read-only slow", CommandSInterCard::Range),
-                        MakeCmdAttr<CommandSDiffStore>("sdiffstore", -3, "write slow", 1, -1, 1),
-                        MakeCmdAttr<CommandSUnionStore>("sunionstore", -3, "write slow", 1, -1, 1),
-                        MakeCmdAttr<CommandSInterStore>("sinterstore", -3, "write slow", 1, -1, 1),
-                        MakeCmdAttr<CommandSScan>("sscan", -3, "read-only", 1, 1, 1), )
+                        MakeCmdAttr<CommandSRandMember>("srandmember", -2, "read-only", 1, 1, 1),
+                        // MakeCmdAttr<CommandSMove>("smove", 4, "write", 1, 2, 1),
+                        // MakeCmdAttr<CommandSDiff>("sdiff", -2, "read-only", 1, -1, 1),
+                        // MakeCmdAttr<CommandSUnion>("sunion", -2, "read-only", 1, -1, 1),
+                        // MakeCmdAttr<CommandSInter>("sinter", -2, "read-only", 1, -1, 1),
+                        // MakeCmdAttr<CommandSInterCard>("sintercard", -3, "read-only", CommandSInterCard::Range),
+                        // MakeCmdAttr<CommandSDiffStore>("sdiffstore", -3, "write", 1, -1, 1),
+                        // MakeCmdAttr<CommandSUnionStore>("sunionstore", -3, "write", 1, -1, 1),
+                        // MakeCmdAttr<CommandSInterStore>("sinterstore", -3, "write", 1, -1, 1),
+                        MakeCmdAttr<CommandSScan>("sscan", -3, "read-only", 1, 1, 1),
+                        MakeCmdAttr<CommandSScanV2>("sscanv2", -3, "read-only", 1, 1, 1), )
 
 }  // namespace redis

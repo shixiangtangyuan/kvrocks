@@ -22,7 +22,6 @@
 
 #include <cstdlib>
 #include <memory>
-#include <string_view>
 #include <utility>
 
 #include "event2/buffer.h"
@@ -45,8 +44,6 @@ struct UniqueEvbufReadln : UniqueFreePtr<char[]> {
       : UniqueFreePtr(evbuffer_readln(buffer, &length, eol_style)) {}
 
   size_t length;
-
-  std::string_view View() { return {get(), length}; }
 };
 
 using StaticEvbufFree = StaticFunction<decltype(evbuffer_free), evbuffer_free>;

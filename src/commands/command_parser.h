@@ -24,12 +24,10 @@
 #include <cctype>
 #include <functional>
 #include <iterator>
-#include <type_traits>
 
 #include "parse_util.h"
 #include "status.h"
 #include "string_util.h"
-#include "type_util.h"
 
 template <typename Iter>
 struct MoveIterator : Iter {
@@ -48,28 +46,16 @@ struct CommandParser {
 
   CommandParser(Iter begin, Iter end) : begin_(std::move(begin)), end_(std::move(end)) {}
 
-  template <typename Container, std::enable_if_t<std::is_lvalue_reference_v<Container> &&
-                                                     !std::is_same_v<RemoveCVRef<Container>, CommandParser>,
-                                                 int> = 0>
-  explicit CommandParser(Container&& con, size_t skip_num = 0) : CommandParser(std::begin(con), std::end(con)) {
+  template <typename Container>
+  explicit CommandParser(const Container& con, size_t skip_num = 0) : CommandParser(std::begin(con), std::end(con)) {
     std::advance(begin_, skip_num);
   }
 
-  template <typename Container, std::enable_if_t<!std::is_lvalue_reference_v<Container> &&
-                                                     !std::is_same_v<RemoveCVRef<Container>, CommandParser>,
-                                                 int> = 0>
+  template <typename Container>
   explicit CommandParser(Container&& con, size_t skip_num = 0)
       : CommandParser(MoveIterator(std::begin(con)), MoveIterator(std::end(con))) {
     std::advance(begin_, skip_num);
   }
-
-  CommandParser(const CommandParser&) = default;
-  CommandParser(CommandParser&&) noexcept = default;
-
-  CommandParser& operator=(const CommandParser&) = default;
-  CommandParser& operator=(CommandParser&&) noexcept = default;
-
-  ~CommandParser() = default;
 
   decltype(auto) RawPeek() const { return *begin_; }
 
@@ -88,7 +74,7 @@ struct CommandParser {
   std::enable_if_t<IsRandomAccessIter, size_t> Remains() const {
     // O(1) iff Iter is random access iterator.
     auto d = std::distance(begin_, end_);
-    CHECK(d >= 0);
+    DCHECK(d >= 0);
     return d;
   }
 
@@ -177,6 +163,3 @@ CommandParser(const Container&, size_t = 0) -> CommandParser<typename Container:
 
 template <typename Container>
 CommandParser(Container&&, size_t = 0) -> CommandParser<MoveIterator<typename Container::iterator>>;
-
-template <typename Container>
-using CommandParserFromConst = CommandParser<typename Container::const_iterator>;
