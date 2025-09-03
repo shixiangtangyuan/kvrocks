@@ -54,6 +54,7 @@
 #include "rocksdb/convenience.h"
 #include "stats/stats.h"
 #include "status.h"
+#include "warmup/orchestrator/warmup_orchestrator.h"
 
 const int kReplIdLength = 16;
 
@@ -454,6 +455,11 @@ class StorageManager : public std::enable_shared_from_this<StorageManager> {
         return {Status::NotOK, "failed to open storage"};
       }
       AddStorage(db_id, store);
+
+      // Start warmup for this storage if enabled
+      if (config->warmup_enabled) {
+        StartWarmupForStorage(db_id);
+      }
     }
 
     return Status::OK();
@@ -516,6 +522,17 @@ class StorageManager : public std::enable_shared_from_this<StorageManager> {
   Status GetWalDataWithCmd(uint64_t db_id, uint64_t *next_seq, std::vector<std::vector<std::string>> *result,
                            bool *is_finished);
 
+  // Warmup management
+  void StartWarmupForStorage(uint64_t db_id);
+  void StopWarmupForStorage(uint64_t db_id);
+
+  // === 新增：统一的 orchestrator 管理与互斥入口 ===
+  // 启动（仅当 Idle），返回是否成功提交
+  bool StartWarmupIfIdle(uint64_t db_id, const std::string &mode, double threshold);
+  // 查询
+  bool IsWarmupRunning(uint64_t db_id);
+  std::shared_ptr<warmup::WarmupOrchestrator> GetWarmupOrchestrator(uint64_t db_id);
+
  private:
   FRIEND_TEST(StorageManager, simpletest);
 
@@ -524,6 +541,10 @@ class StorageManager : public std::enable_shared_from_this<StorageManager> {
   std::shared_ptr<rocksdb::RateLimiter> rate_limiter_ = nullptr;
   mutable std::shared_mutex mutex_;
   std::unordered_map<uint64_t, std::shared_ptr<Storage>> store_map_;
+
+  // Warmup orchestrators for each storage
+  mutable std::shared_mutex warmup_mutex_;
+  std::unordered_map<uint64_t, std::shared_ptr<warmup::WarmupOrchestrator>> warmup_orchestrators_;
 
   void initRocksDBComm(Config *config);
 

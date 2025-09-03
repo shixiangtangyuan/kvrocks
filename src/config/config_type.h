@@ -150,6 +150,37 @@ class IntegerField : public ConfigField {
   IntegerType max_ = std::numeric_limits<IntegerType>::max();
 };
 
+class DoubleField : public ConfigField {
+ public:
+  DoubleField(double *receiver, double n, double min, double max)
+      : receiver_(receiver), default_(n), min_(min), max_(max) {
+    *receiver_ = n;
+  }
+  ~DoubleField() override = default;
+  std::string Default() const override { return std::to_string(default_); }
+  std::string ToString() const override { return std::to_string(*receiver_); }
+  Status ToNumber(int64_t *n) const override {
+    *n = static_cast<int64_t>(*receiver_);
+    return Status::OK();
+  }
+  Status Set(const std::string &v) override {
+    auto s = ParseFloat<double>(v);
+    if (!s.IsOK()) return s;
+    double value = s.GetValue();
+    if (value < min_ || value > max_) {
+      return {Status::NotOK, "out of numeric range"};
+    }
+    *receiver_ = value;
+    return Status::OK();
+  }
+
+ private:
+  double *receiver_;
+  double default_ = 0.0;
+  double min_ = std::numeric_limits<double>::lowest();
+  double max_ = std::numeric_limits<double>::max();
+};
+
 class OctalField : public ConfigField {
  public:
   OctalField(int *receiver, int n, int min, int max) : receiver_(receiver), default_(n), min_(min), max_(max) {

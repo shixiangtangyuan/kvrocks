@@ -38,6 +38,7 @@
 #include "storage/rdb.h"
 #include "string_util.h"
 #include "time_util.h"
+#include "warmup/orchestrator/warmup_orchestrator.h"
 
 namespace redis {
 
@@ -1234,6 +1235,74 @@ class CommandFlushSlot : public Commander {
   int end_slot_;
 };
 
+class CommandWarmup : public Commander {
+ public:
+  Status Parse(const std::vector<std::string> &args) override {
+    if (args.size() < 1) {
+      return {Status::NotOK, "wrong number of arguments"};
+    }
+    return Status::OK();
+  }
+
+  Status Execute(Server *srv, Connection *conn, std::string *output, engine::Storage *storage) override {
+    if (!srv->GetConfig()->warmup_enabled) {
+      return {Status::RedisExecErr, "warmup feature disabled by config"};
+    }
+
+    if (!srv->GetConfig()->warmup_cmd_enabled) {
+      return {Status::RedisExecErr, "warmup command disabled by config"};
+    }
+
+    // 新实现：通过 StorageManager 统一互斥与调度
+    auto sm = srv->storage_mgr;  // 直接访问公共成员变量
+    if (!sm) {
+      return {Status::RedisExecErr, "no storage manager"};
+    }
+
+    const uint64_t db_id = storage ? storage->GetDBId() : 0;  // 或其它分库标识
+    if (db_id == 0) {
+      return {Status::RedisExecErr, "invalid db id"};
+    }
+
+    if (sm->IsWarmupRunning(db_id)) {
+      return {Status::RedisExecErr, "BUSY warmup in progress"};
+    }
+
+    // Parse optional arguments
+    double threshold = srv->GetConfig()->warmup_progress_threshold;
+    std::string mode = "redis";
+
+    for (size_t i = 1; i < args_.size(); i++) {
+      auto arg = args_[i];
+      auto pos = arg.find('=');
+      if (pos != std::string::npos) {
+        auto key = arg.substr(0, pos);
+        auto value = arg.substr(pos + 1);
+
+        if (key == "threshold") {
+          try {
+            threshold = std::stod(value);
+            if (threshold < 0.0 || threshold > 1.0) {
+              return {Status::RedisExecErr, "threshold must be between 0.0 and 1.0"};
+            }
+          } catch (...) {
+            return {Status::RedisExecErr, "invalid threshold value"};
+          }
+        } else if (key == "mode") {
+          mode = value;
+        }
+      }
+    }
+
+    if (!sm->StartWarmupIfIdle(db_id, mode, threshold)) {
+      return {Status::RedisExecErr, "BUSY warmup not idle"};
+    }
+
+    *output = "QUEUED";
+    return Status::OK();
+  }
+};
+
 REDIS_REGISTER_COMMANDS(MakeCmdAttr<CommandAuth>("auth", 2, "read-only ok-loading", 0, 0, 0),
                         MakeCmdAttr<CommandPing>("ping", -1, "read-only", 0, 0, 0),
                         // MakeCmdAttr<CommandSelect>("select", 2, "read-only", 0, 0, 0),
@@ -1271,6 +1340,7 @@ REDIS_REGISTER_COMMANDS(MakeCmdAttr<CommandAuth>("auth", 2, "read-only ok-loadin
                         // MakeCmdAttr<CommandFlushBackup>("flushbackup", 1, "read-only no-script", 0, 0, 0),
                         MakeCmdAttr<CommandFlushSlot>("flushslots", -2, "read-only", 0, 0, 0),
                         MakeCmdAttr<CommandStats>("stats", -1, "read-only", 0, 0, 0),
+                        MakeCmdAttr<CommandWarmup>("warmup", -1, "read-only", 0, 0, 0),
                         // MakeCmdAttr<CommandRdb>("rdb", -3, "write exclusive", 0, 0, 0),
 )
 

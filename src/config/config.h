@@ -252,6 +252,47 @@ struct Config {
   bool duration_ingest_close_auto_compact = false;
   bool disable_auto_compactions_before_serving = true;
 
+  // ===== Warmup（新增） =====
+  bool warmup_enabled = false;
+  std::string warmup_strategy = "fi";  // fi | iter | hybrid(预留)
+  int warmup_timeout_sec = 300;
+  int warmup_concurrency = 4;
+  int warmup_batch_size = 1000;
+  int64_t warmup_rate_limit_mb = 100;
+  double warmup_progress_threshold = 0.7;
+  bool warmup_cmd_enabled = true;
+
+  // Iterator 策略
+  bool warmup_iter_fill_cache = true;
+  int64_t warmup_iter_max_mb = 1024;
+  int warmup_iter_seek_step = 4096;
+  std::string warmup_iter_cf = "default";
+  std::string warmup_iter_ranges = "";
+
+  // FI 策略
+  double warmup_fi_budget_ratio = 0.7;  // 占 block cache 的比例
+  double warmup_fi_coverage_ratio = 0.2;
+  double warmup_fi_max_single_file_ratio = 0.10;
+  int warmup_fi_min_files_per_level = 3;
+  int warmup_fi_max_files_per_level = 100;
+  double warmup_fi_kappa = 1.0;
+  std::string warmup_fi_level_weights = "0:0.5,1:0.3,2:0.15,3:0.05";
+
+  // FI 预热策略配置
+  // 是否启用与 max_open_files 句柄缓存的去重
+  bool fi_dedup_enabled = false;
+
+  // Iterator 策略配置
+  uint64_t warmup_iter_readahead_kb = 64;            // Iterator readahead 大小（KB）
+  bool warmup_iter_verify_checksums = false;         // 是否校验 checksum（启动阶段提速）
+  bool warmup_iter_prefix_same_as_start = false;     // 是否使用 prefix_same_as_start
+  uint64_t warmup_iter_tombstone_stop_after = 1000;  // 墓碑命中阈值（超过则早停）
+  int32_t warmup_iter_read_tier = 0;                 // 0=kReadAllTier, 1=kBlockCacheTier
+  bool warmup_fi_dedupe_with_table_cache = false;    // 是否与 tablecache 去重
+
+  // 若能接入真实 block cache 容量，这里填入。否则为 0 使用默认 16GB 估计
+  uint64_t warmup_block_cache_bytes = 0;
+
   struct RocksDB {
     int block_size;
     bool cache_index_and_filter_blocks;

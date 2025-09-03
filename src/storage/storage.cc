@@ -58,6 +58,7 @@
 #include "table_properties_collector.h"
 #include "time_util.h"
 #include "unique_fd.h"
+#include "warmup/orchestrator/warmup_orchestrator.h"
 
 namespace engine {
 
@@ -1666,6 +1667,79 @@ Status StorageManager::GetWalDataWithCmd(uint64_t db_id, uint64_t *next_seq,
   }
 
   return Status::OK();
+}
+
+void StorageManager::StartWarmupForStorage(uint64_t db_id) {
+  // 为了互斥，这里使用 StartWarmupIfIdle，避免与命令入口竞争
+  StartWarmupIfIdle(db_id, "startup", config_->warmup_progress_threshold);
+}
+
+bool StorageManager::StartWarmupIfIdle(uint64_t db_id, const std::string &mode, double threshold) {
+  std::shared_ptr<warmup::WarmupOrchestrator> orch;
+  {
+    std::unique_lock<std::shared_mutex> lk(warmup_mutex_);
+    auto it = warmup_orchestrators_.find(db_id);
+    if (it == warmup_orchestrators_.end()) {
+      std::shared_lock<std::shared_mutex> storage_lk(mutex_);
+      auto storage_it = store_map_.find(db_id);
+      if (storage_it == store_map_.end()) {
+        LOG(ERROR) << "Storage not found for db_id: " << db_id;
+        return false;
+      }
+      auto storage = storage_it->second;
+      auto db = storage->GetDB();
+      if (!db) {
+        LOG(ERROR) << "DB not available for db_id: " << db_id;
+        return false;
+      }
+      orch = std::make_shared<warmup::WarmupOrchestrator>(db, config_);
+      warmup_orchestrators_.emplace(db_id, orch);
+    } else {
+      orch = it->second;
+    }
+  }
+
+  // 只要不是 Idle，就拒绝（互斥）
+  if (!orch->StartIfIdle(mode, threshold)) return false;
+
+  // 捕获 shared_ptr，线程即便 map 被 erase 也安全
+  std::thread([this, orch, mode, threshold]() {
+    // 真正的预热执行逻辑：编排 provider/engine、进度阈值/超时控制等
+    // * 这里不再访问 warmup_orchestrators_ 容器，避免并发风险 *
+    // -- 执行开始 --
+    // Orchestrator::Run() 内部按策略推进，省略细节
+    // orch->Run(mode, threshold);
+    // -- 执行结束 --
+    orch->MarkFinished();
+  }).detach();
+
+  LOG(INFO) << "Started warmup for db_id: " << db_id << " with mode: " << mode << " and threshold: " << threshold;
+  return true;
+}
+
+bool StorageManager::IsWarmupRunning(uint64_t db_id) {
+  std::shared_lock<std::shared_mutex> lk(warmup_mutex_);
+  auto it = warmup_orchestrators_.find(db_id);
+  if (it == warmup_orchestrators_.end()) return false;
+  return it->second && it->second->IsRunning();
+}
+
+std::shared_ptr<warmup::WarmupOrchestrator> StorageManager::GetWarmupOrchestrator(uint64_t db_id) {
+  std::shared_lock<std::shared_mutex> lk(warmup_mutex_);
+  auto it = warmup_orchestrators_.find(db_id);
+  if (it == warmup_orchestrators_.end()) return nullptr;
+  return it->second;
+}
+
+void StorageManager::StopWarmupForStorage(uint64_t db_id) {
+  std::unique_lock<std::shared_mutex> lk(warmup_mutex_);
+  auto it = warmup_orchestrators_.find(db_id);
+  if (it != warmup_orchestrators_.end()) {
+    // In the new design, warmup is one-shot and cannot be stopped
+    // We just remove the orchestrator from the map
+    warmup_orchestrators_.erase(it);
+    LOG(INFO) << "Removed warmup orchestrator for db_id: " << db_id;
+  }
 }
 
 }  // namespace engine

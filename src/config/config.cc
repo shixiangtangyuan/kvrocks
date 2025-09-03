@@ -268,6 +268,41 @@ Config::Config() {
       {"disable-auto-compactions-before-serveing", true,
        new YesNoField(&disable_auto_compactions_before_serving, true)},
 
+      // warmup configuration
+      {"warmup-enabled", false, new YesNoField(&warmup_enabled, false)},
+      {"warmup-strategy", false, new StringField(&warmup_strategy, "fi")},
+      {"warmup-timeout-sec", false, new IntField(&warmup_timeout_sec, 300, 1, INT_MAX)},
+      {"warmup-concurrency", false, new IntField(&warmup_concurrency, 4, 1, 32)},
+      {"warmup-batch-size", false, new IntField(&warmup_batch_size, 1000, 1, 10000)},
+      {"warmup-rate-limit-mb", false, new Int64Field(&warmup_rate_limit_mb, 100, 1, 1000)},
+      {"warmup-progress-threshold", false, new DoubleField(&warmup_progress_threshold, 0.7, 0.0, 1.0)},
+      {"warmup-cmd-enabled", false, new YesNoField(&warmup_cmd_enabled, true)},
+
+      // iterator strategy configuration
+      {"warmup-iter-read-tier", false, new IntField(&warmup_iter_read_tier, 0, 0, 1)},
+      {"warmup-iter-fill-cache", false, new YesNoField(&warmup_iter_fill_cache, true)},
+      {"warmup-iter-max-mb", false, new Int64Field(&warmup_iter_max_mb, 1024, 1, 10000)},
+      {"warmup-iter-seek-step", false, new IntField(&warmup_iter_seek_step, 4096, 1, 100000)},
+      {"warmup-iter-cf", false, new StringField(&warmup_iter_cf, "default")},
+      {"warmup-iter-ranges", false, new StringField(&warmup_iter_ranges, "")},
+
+      // FI strategy configuration
+      {"warmup-fi-budget-ratio", false, new DoubleField(&warmup_fi_budget_ratio, 0.7, 0.0, 1.0)},
+      {"warmup-fi-coverage-ratio", false, new DoubleField(&warmup_fi_coverage_ratio, 0.2, 0.0, 1.0)},
+      {"warmup-fi-max-single-file-ratio", false, new DoubleField(&warmup_fi_max_single_file_ratio, 0.10, 0.0, 1.0)},
+      {"warmup-fi-min-files-per-level", false, new IntField(&warmup_fi_min_files_per_level, 3, 1, 100)},
+      {"warmup-fi-max-files-per-level", false, new IntField(&warmup_fi_max_files_per_level, 100, 1, 1000)},
+      {"warmup-fi-kappa", false, new DoubleField(&warmup_fi_kappa, 1.0, 0.0, 10.0)},
+      {"warmup-fi-level-weights", false, new StringField(&warmup_fi_level_weights, "0:0.5,1:0.3,2:0.15,3:0.05")},
+      {"fi-dedup-enabled", false, new YesNoField(&fi_dedup_enabled, false)},
+      {"warmup-iter-readahead-kb", false, new UInt64Field(&warmup_iter_readahead_kb, 64, 0, 1024)},
+      {"warmup-iter-verify-checksums", false, new YesNoField(&warmup_iter_verify_checksums, false)},
+      {"warmup-iter-prefix-same-as-start", false, new YesNoField(&warmup_iter_prefix_same_as_start, false)},
+      {"warmup-iter-tombstone-stop-after", false, new UInt64Field(&warmup_iter_tombstone_stop_after, 1000, 0, 10000)},
+      {"warmup-iter-read-tier", false, new IntField(&warmup_iter_read_tier, 0, 0, 1)},
+      {"warmup-fi-dedupe-with-table-cache", false, new YesNoField(&warmup_fi_dedupe_with_table_cache, false)},
+      {"warmup-block-cache-bytes", false, new UInt64Field(&warmup_block_cache_bytes, 0, 0, UINT64_MAX)},
+
       // worker
       {"worker-blocked-threshold-seconds", false,
        new UInt64Field(&worker_blocked_threshold_seconds, 120, 0, UINT64_MAX)},
